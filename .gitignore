@@ -1,0 +1,10 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+*.log
+state/*.json
+state/*.jsonl
+state/watcher_alive
+!state/.gitkeep
+.gh-token

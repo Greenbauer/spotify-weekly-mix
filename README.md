@@ -1,0 +1,174 @@
+# Weekly Spotify discovery mixer
+
+A ~40-track **novel + popular** Weekly Mix for a personal Spotify account (Grok Bot / local agent). Nothing here
+registers a Spotify app, starts OAuth, or calls a live user account.
+
+```
+.venv/bin/python mix.py self_test     # local filters, no network
+.venv/bin/python mix.py build_mix     # compute 40 tracks (needs tokens)
+.venv/bin/python mix.py publish       # create/replace "Weekly Mix"
+.venv/bin/python mix.py publish --dry-run
+.venv/bin/python mix.py log_plays     # record plays of OUR playlist only
+.venv/bin/python mix.py probe         # which Spotify endpoints still work
+.venv/bin/python mix.py ingest_ui     # mark mix tracks from a now-playing JSONL
+.venv/bin/python mix.py maybe_refresh # if the current mix is fully heard, publish a new one
+```
+
+## API reality (August 2026)
+
+Two Spotify lock-downs stacked:
+
+### 1. 27 Nov 2024 — discovery endpoints killed for new apps
+
+[Official post](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api).
+New apps and Dev Mode apps without extended quota get **403** on:
+
+| Endpoint | Status for a new app |
+|---|---|
+| `GET /v1/recommendations` | dead |
+| `GET /v1/artists/{id}/related-artists` | dead |
+| `GET /v1/audio-features`, `/audio-analysis` | dead |
+| Featured / category playlists, 30s previews in multi-get | dead |
+
+Grandfathered **extended quota** apps that already used these still have them.
+Individuals generally cannot apply for extended quota anymore (org + 250k MAU bar since 2025).
+
+### 2. Feb / Mar 2026 — Dev Mode surface shrinks further
+
+[Changelog](https://developer.spotify.com/documentation/web-api/references/changes/february-2026)
+and [migration guide](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide).
+**Extended quota apps are unchanged.** Dev Mode apps (what a personal mixer will be):
+
+Still works (and this script uses):
+
+- `GET /me`, `GET /me/playlists`, `POST /me/playlists`, `PUT /playlists/{id}`
+- Playlist items: `GET/PUT/POST/DELETE /playlists/{id}/items` (**`/tracks` renamed**)
+- Liked songs: `GET /me/tracks`
+- Recently played: `GET /me/player/recently-played` (log_plays only)
+- Search: `GET /search` (**max limit 10**)
+- `GET /artists/{id}`, `GET /artists/{id}/albums`, `GET /albums/{id}/tracks`, `GET /tracks/{id}`
+- `GET /me/top/{type}` — **available, but this mixer NEVER calls it**
+
+Removed or stripped in Dev Mode:
+
+- `GET /artists/{id}/top-tracks` — **removed**
+- Batch `GET /tracks?ids=`, `GET /artists?ids=` — **removed** (fetch one-by-one)
+- `POST /users/{id}/playlists`, `GET /users/{id}/playlists` — use `/me/playlists`
+- Track/artist **`popularity` field removed**
+- Browse new-releases / categories
+
+Dev Mode also: app owner must have **Premium**, **5 users** per app. Client IDs per
+developer raised to 25 in July 2026.
+
+`mix.py probe` records which of related-artists / recommendations / top-tracks /
+popularity still work for *your* token, then the mixer uses them if present.
+
+## Discovery method (no deprecated recs endpoint)
+
+```
+playlists you CREATED  (+ optional Liked Songs as artist seeds)
+        │
+        ├─ exclude: seasonal (wrong month), baby/kids/nursery, "Weekly Mix"
+        ├─ those tracks → EXCLUDE set
+        └─ those artists → SEED set
+                │
+                ▼
+     similar artists, in order:
+       1. Last.fm artist.getSimilar          (if LASTFM_API_KEY)
+       2. MusicBrainz name → MBID
+          + ListenBrainz labs similar-artists (no key)
+       3. Spotify related-artists             (only if probe says it still works)
+                │
+                ▼
+     those artists' popular tracks:
+       1. Last.fm artist.getTopTracks → Spotify search resolve
+          popularity proxy: 15 * log10(listeners+1)  (~3k listeners ≈ 55)
+       2. Spotify /artists/{id}/top-tracks            (extended quota only)
+       3. Spotify search artist:"Name" type=track     (rank ≈ popularity)
+                │
+                ▼
+     drop if in created playlists, likes, or state/played.json
+     keep popularity >= 55 (Spotify pop if present, else Last.fm proxy)
+     cap 2 tracks / artist, ~40 tracks, week-stable RNG
+```
+
+**Never seeded from:** `GET /me/top`, recently-played, baby/house listening,
+out-of-season holiday playlists, Spotify's own editorial lists.
+
+Season from **playlist name** (skipped as seeds unless the current month matches):
+
+| Name matches | In-season |
+|---|---|
+| Christmas / Xmas / holiday | December |
+| Halloween | October |
+| Thanksgiving | 15–30 November |
+| 4th of July | 25 Jun – 10 Jul |
+| Valentine | February |
+
+## Env vars
+
+Copy `.env.example` to `.env` (gitignored).
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `SPOTIFY_CLIENT_ID` | yes (for live run) | Dashboard app |
+| `SPOTIFY_CLIENT_SECRET` | yes | Dashboard secret |
+| `SPOTIFY_REFRESH_TOKEN` | yes | Headless token; script refreshes access |
+| `SPOTIFY_ACCESS_TOKEN` | no | Skip refresh if still valid |
+| `LASTFM_API_KEY` | recommended | Similar + top-tracks; free at last.fm/api |
+| `MIX_PLAYLIST_NAME` | no | default `Weekly Mix` |
+| `MIX_SIZE` | no | default `40` |
+| `MIX_MIN_POPULARITY` | no | default `55` |
+| `MIX_MAX_PER_ARTIST` | no | default `2` |
+| `MIX_USE_LIKES` | no | default `1` (likes = seeds + exclude, never output) |
+
+## Local state (`state/`)
+
+| File | Written by | Contents |
+|---|---|---|
+| `config.json` | `publish` | mix playlist id + uri |
+| `last_mix.json` | `build_mix` | the 40 tracks + week stamp |
+| `played.json` | `log_plays` | track ids played *from our playlist URI* |
+| `similar_cache.json` | `build_mix` | Last.fm/LB similar-artist cache (14d) |
+| `probe.json` | `probe` | which Spotify endpoints still work |
+
+JSON under `state/` is gitignored except `.gitkeep`.
+
+## What we still need from you
+
+1. **Spotify developer app** at https://developer.spotify.com/dashboard
+   (you own it; Premium required for Dev Mode). One redirect URI e.g.
+   `http://127.0.0.1:8080/callback`.
+2. **OAuth once**, scopes:
+
+   `playlist-read-private playlist-read-collaborative user-library-read playlist-modify-private playlist-modify-public user-read-recently-played user-read-private`
+
+   Print the URL (does not open a browser or start a server):
+
+   ```
+   .venv/bin/python mix.py print_auth_url --redirect-uri http://127.0.0.1:8080/callback
+   ```
+
+   Exchange the `code` yourself:
+
+   ```
+   curl -u "$SPOTIFY_CLIENT_ID:$SPOTIFY_CLIENT_SECRET" -d grant_type=authorization_code \
+     -d code=THE_CODE -d redirect_uri=http://127.0.0.1:8080/callback \
+     https://accounts.spotify.com/api/token
+   ```
+
+   Put `refresh_token` in `.env` as `SPOTIFY_REFRESH_TOKEN`.
+3. **Last.fm API key** (optional but much better discovery): https://www.last.fm/api/account/create
+4. After first `publish`, run `log_plays` often (recently-played is a short window)
+   so heard mix tracks stay out of next week's pool.
+
+## Layout
+
+```
+mix.py oauth.py
+requirements.txt .env.example
+scripts/          optional web-player skip helpers
+state/            local only (gitignored JSON)
+```
+
+Do not commit `.env`, play logs, playlist ids, or listening history.
