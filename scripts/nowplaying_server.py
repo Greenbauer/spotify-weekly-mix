@@ -1,6 +1,19 @@
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json, os
-PATH='/workspace/spotify-weekly-mix/state/nowplaying.jsonl'
+
+import os
+from pathlib import Path
+
+# Repo-relative so this works from any checkout. mix.py's ingest_ui reads
+# <repo>/state/nowplaying.jsonl; a hardcoded absolute path meant the writer and
+# the reader never pointed at the same file and ingest_ui always saw nothing.
+STATE_PATH = Path(
+    os.environ.get("MIX_STATE_DIR")
+    or (Path(__file__).resolve().parent.parent / "state")
+) / "nowplaying.jsonl"
+
+PATH = str(STATE_PATH)
+STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_POST(self):

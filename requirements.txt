@@ -1,2 +1,1 @@
 requests>=2.32.0
-spotipy>=2.24.0

@@ -1,9 +1,20 @@
 import json
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import os
 from pathlib import Path
 
-STATE = Path('/workspace/spotify-weekly-mix/state/nowplaying.jsonl')
+# Repo-relative so this works from any checkout. mix.py's ingest_ui reads
+# <repo>/state/nowplaying.jsonl; a hardcoded absolute path meant the writer and
+# the reader never pointed at the same file and ingest_ui always saw nothing.
+STATE_PATH = Path(
+    os.environ.get("MIX_STATE_DIR")
+    or (Path(__file__).resolve().parent.parent / "state")
+) / "nowplaying.jsonl"
+
+STATE = STATE_PATH
+STATE.parent.mkdir(parents=True, exist_ok=True)
 
 def last_key():
     try:

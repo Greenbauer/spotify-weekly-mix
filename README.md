@@ -1,7 +1,8 @@
 # Weekly Spotify discovery mixer
 
-A ~40-track **novel + popular** Weekly Mix for a personal Spotify account (Grok Bot / local agent). Nothing here
-registers a Spotify app, starts OAuth, or calls a live user account.
+A ~40-track **novel + popular** Weekly Mix for a personal Spotify account (Grok Bot / local agent).
+`mix.py` never starts OAuth by itself; `oauth.py` is the one-time, opt-in helper that does
+(see [Setup](#what-we-still-need-from-you)). Registering the Spotify app is still on you.
 
 ```
 .venv/bin/python mix.py self_test     # local filters, no network
@@ -11,8 +12,12 @@ registers a Spotify app, starts OAuth, or calls a live user account.
 .venv/bin/python mix.py log_plays     # record plays of OUR playlist only
 .venv/bin/python mix.py probe         # which Spotify endpoints still work
 .venv/bin/python mix.py ingest_ui     # mark mix tracks from a now-playing JSONL
-.venv/bin/python mix.py maybe_refresh # if the current mix is fully heard, publish a new one
+.venv/bin/python mix.py maybe_refresh # if the current mix is used up, publish a new one
+.venv/bin/python mix.py watch_plays   # adaptive now-playing poll so short skips count
 ```
+
+`build_mix` and `publish` take `--force` to overwrite a mix much smaller than the one it
+replaces. Without it they refuse, so a rate-limited build cannot destroy a good mix.
 
 ## API reality (August 2026)
 
@@ -60,8 +65,9 @@ Removed or stripped in Dev Mode:
 Dev Mode also: app owner must have **Premium**, **5 users** per app. Client IDs per
 developer raised to 25 in July 2026.
 
-`mix.py probe` records which of related-artists / recommendations / top-tracks /
-popularity still work for *your* token, then the mixer uses them if present.
+`mix.py probe` reports which of related-artists / recommendations / top-tracks /
+popularity still work for *your* token. It only prints: the mixer feature-detects the
+same endpoints per run and disables them after the first 4xx, so there is nothing to persist.
 
 ## Discovery method (no deprecated recs endpoint)
 
@@ -95,6 +101,11 @@ playlists you CREATED  (+ optional Liked Songs as artist seeds)
 **Never seeded from:** `GET /me/top`, recently-played, baby/house listening,
 out-of-season holiday playlists, Spotify's own editorial lists.
 
+**Excluded from output regardless:** every track in every playlist you created — including
+the ones skipped for seeding — plus Liked Songs and the play log. Skipping a playlist as a
+taste source never makes its tracks eligible to be recommended back to you. The only total
+skip is the Weekly Mix itself, so an unheard track from last week can still return.
+
 Season from **playlist name** (skipped as seeds unless the current month matches):
 
 | Name matches | In-season |
@@ -120,7 +131,7 @@ Copy `.env.example` to `.env` (gitignored).
 | `MIX_SIZE` | no | default `40` |
 | `MIX_MIN_POPULARITY` | no | default `55` |
 | `MIX_MAX_PER_ARTIST` | no | default `2` |
-| `MIX_USE_LIKES` | no | default `1` (likes = seeds + exclude, never output) |
+| `MIX_USE_LIKES` | no | default `1`. Likes are ALWAYS excluded from output; this only controls whether their artists also seed. |
 
 ## Local state (`state/`)
 
@@ -130,7 +141,8 @@ Copy `.env.example` to `.env` (gitignored).
 | `last_mix.json` | `build_mix` | the 40 tracks + week stamp |
 | `played.json` | `log_plays` | track ids played *from our playlist URI* |
 | `similar_cache.json` | `build_mix` | Last.fm/LB similar-artist cache (14d) |
-| `probe.json` | `probe` | which Spotify endpoints still work |
+| `nowplaying.jsonl` | `scripts/nowplaying_*.py` | web-player now-playing log, read by `ingest_ui` |
+| `watch_plays.pid` | `watch_plays` | pid of the running watcher |
 
 JSON under `state/` is gitignored except `.gitkeep`.
 
@@ -139,9 +151,13 @@ JSON under `state/` is gitignored except `.gitkeep`.
 1. **Spotify developer app** at https://developer.spotify.com/dashboard
    (you own it; Premium required for Dev Mode). One redirect URI e.g.
    `http://127.0.0.1:8080/callback`.
-2. **OAuth once**, scopes:
+2. **OAuth once.** Easiest: `.venv/bin/python oauth.py` — it serves the callback on
+   `http://127.0.0.1:8080/callback`, exchanges the code, and writes `SPOTIFY_REFRESH_TOKEN`
+   into `.env` with mode 600. It prints the URL to `/tmp/spotify-auth-url.txt`.
 
-   `playlist-read-private playlist-read-collaborative user-library-read playlist-modify-private playlist-modify-public user-read-recently-played user-read-private`
+   To do it by hand instead, these are the scopes:
+
+   `playlist-read-private playlist-read-collaborative user-library-read playlist-modify-private playlist-modify-public user-read-recently-played user-read-currently-playing user-read-playback-state user-read-private`
 
    Print the URL (does not open a browser or start a server):
 
@@ -165,7 +181,8 @@ JSON under `state/` is gitignored except `.gitkeep`.
 ## Layout
 
 ```
-mix.py oauth.py
+mix.py            the mixer CLI
+oauth.py          one-time OAuth helper (writes .env, mode 600)
 requirements.txt .env.example
 scripts/          optional web-player skip helpers
 state/            local only (gitignored JSON)

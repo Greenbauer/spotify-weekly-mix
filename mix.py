@@ -21,9 +21,11 @@ popularity field in Feb 2026):
     → drop anything already in created playlists, likes, or the play log
     → keep ~40, biased to popular, max N per artist
 
-Commands: build_mix | publish | log_plays | probe | self_test
+Commands: build_mix | publish | log_plays | watch_plays | ingest_ui |
+          maybe_refresh | probe | print_auth_url | self_test
 
-This script does not register a Spotify app and does not start OAuth.
+This script does not register a Spotify app and does not start OAuth;
+oauth.py is the separate, opt-in helper that does.
 """
 
 from __future__ import annotations
@@ -34,10 +36,11 @@ import os
 import random
 import re
 import sys
+import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -53,6 +56,18 @@ MB_API = "https://musicbrainz.org/ws/2"
 LB_SIMILAR = "https://labs.api.listenbrainz.org/similar-artists/json"
 LB_SIMILAR_ALGO = "session_based_days_9000_session_300_contribution_5_threshold_15_limit_50_skip_30"
 UA = "spotify-weekly-mix/1.0 (personal discovery mixer)"
+
+# A rebuilt mix this much smaller than the one it replaces is a failed build,
+# not a new mix. build_mix overwrites last_mix.json BEFORE publish is ever
+# attempted, so without this a rate-limited run destroys the record of the good
+# mix and every later maybe_refresh sees mix_size == 0 and silently no-ops.
+# A ratio (not an absolute floor) so a legitimately small library still works.
+MIX_MIN_REPLACE_RATIO = 0.6
+
+# maybe_refresh's escape hatches. "Every track heard" alone wedges forever on a
+# single track that is region-locked, removed, or relinked to another id.
+MIX_HEARD_RATIO = 0.9
+MIX_MAX_AGE_DAYS = 14
 
 SCOPES = [
     "playlist-read-private",
@@ -120,12 +135,32 @@ def seasonal_reason(name: str, today: date) -> str | None:
     return None
 
 
-def skip_seed_reason(name: str, today: date, mix_name: str) -> str | None:
+def output_playlist_reason(name: str, mix_name: str) -> str | None:
+    """Our own output playlist: skipped entirely, both seeds AND excludes.
+
+    Its tracks must NOT join the exclude set — an unheard track from last
+    week's mix is deliberately allowed to come back (see played_ids).
+    """
     if name.strip().lower() == mix_name.strip().lower():
         return f"output playlist: {name!r}"
+    return None
+
+
+def seed_only_skip_reason(name: str, today: date) -> str | None:
+    """Not a taste source — but its tracks still belong in the exclude set.
+
+    Skipping a playlist for SEEDING used to drop it from the excludes too,
+    which is how songs already in your own library got published back to you
+    as discoveries.
+    """
     if SKIP_SEED_NAME_RE.search(name):
         return f"baby/house playlist: {name!r}"
     return seasonal_reason(name, today)
+
+
+def skip_seed_reason(name: str, today: date, mix_name: str) -> str | None:
+    """True when a playlist contributes no seed artists, for any reason."""
+    return output_playlist_reason(name, mix_name) or seed_only_skip_reason(name, today)
 
 
 # ---------------------------------------------------------------------------
@@ -266,22 +301,42 @@ class SpotifyCaps:
 
 
 class Spotify:
-    def __init__(self, access_token: str) -> None:
+    """Spotify client that owns its own token refresh.
+
+    `refresh` returns a fresh access token. Every request goes through
+    `_request`, which retries ONCE on a 401 with a new token, so callers never
+    have to handle expiry themselves. Access tokens are short-lived and the
+    cached one in .env carries no recorded expiry, so a 401 is the only
+    reliable signal that it went stale.
+    """
+
+    def __init__(self, access_token: str, refresh: Any = None) -> None:
         self.http = Http()
-        self.http.s.headers["Authorization"] = f"Bearer {access_token}"
+        self._set_token(access_token)
         self.caps = SpotifyCaps()
+        self._refresh = refresh
+
+    def _set_token(self, access_token: str) -> None:
+        self.http.s.headers["Authorization"] = f"Bearer {access_token}"
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        resp = self.http.request(method, f"{SPOTIFY_API}{path}", **kwargs)
+        if resp.status_code == 401 and self._refresh is not None:
+            self._set_token(self._refresh())
+            resp = self.http.request(method, f"{SPOTIFY_API}{path}", **kwargs)
+        return resp
 
     def _get(self, path: str, params: dict | None = None) -> Any:
-        resp = self.http.request("GET", f"{SPOTIFY_API}{path}", params=params)
+        resp = self._request("GET", path, params=params)
         if resp.status_code >= 400:
             raise RuntimeError(f"GET {path} -> {resp.status_code}: {resp.text[:400]}")
         return resp.json()
 
     def _send(self, method: str, path: str, **kwargs: Any) -> requests.Response:
-        return self.http.request(method, f"{SPOTIFY_API}{path}", **kwargs)
+        return self._request(method, path, **kwargs)
 
     def get_ok(self, path: str, params: dict | None = None) -> tuple[int, Any]:
-        resp = self.http.request("GET", f"{SPOTIFY_API}{path}", params=params)
+        resp = self._request("GET", path, params=params)
         body: Any = None
         try:
             body = resp.json()
@@ -322,9 +377,16 @@ class Spotify:
         return mine
 
     def playlist_items(self, playlist_id: str) -> list[dict]:
-        """Return track objects. Tries /items (Dev Mode 2026) then /tracks."""
+        """Return track objects. Tries /items (Dev Mode 2026) then /tracks.
+
+        Raises on any non-404 error. An unreadable playlist must never look
+        like an empty one: its track ids would drop out of the exclude set and
+        songs already in your library would be published back as discoveries.
+        404 alone means "wrong path shape for this API version" — keep trying.
+        """
         tracks: list[dict] = []
-        for suffix in (self.caps.playlist_items_path, "items", "tracks"):
+        suffixes = list(dict.fromkeys([self.caps.playlist_items_path, "items", "tracks"]))
+        for suffix in suffixes:
             code, body = self.get_ok(
                 f"/playlists/{playlist_id}/{suffix}",
                 {"limit": 50},
@@ -332,7 +394,10 @@ class Spotify:
             if code == 404:
                 continue
             if code >= 400:
-                continue
+                raise RuntimeError(
+                    f"playlist {playlist_id} /{suffix} -> {code}. Refusing to treat "
+                    f"an unreadable playlist as empty."
+                )
             self.caps.playlist_items_path = suffix
             items = list(body.get("items") or [])
             nxt = body.get("next")
@@ -346,7 +411,9 @@ class Spotify:
                 if t:
                     tracks.append(t)
             return tracks
-        return tracks
+        raise RuntimeError(
+            f"playlist {playlist_id}: no readable items path (tried {suffixes})"
+        )
 
     def liked_tracks(self) -> list[dict]:
         rows = self.paginate("/me/tracks", {"limit": 50})
@@ -716,53 +783,64 @@ class Mixer:
     def collect_library(self, user_id: str) -> tuple[list[dict], set[str], Counter]:
         """Created playlists → seed artists + exclude track ids.
 
-        Liked songs join the exclude set; optionally their artists join seeds.
+        Two independent decisions, which used to be one:
+          - EXCLUDE: every track you already own, from every created playlist
+            and from Liked Songs. Never publish these back to you.
+          - SEED: only playlists that represent taste. Kids, out-of-season and
+            the output playlist are not taste sources.
+        A playlist skipped for seeding still contributes its excludes; only the
+        output playlist is skipped for both.
         """
         mix_name = self.cfg.playlist_name
         today = self.cfg.today
         created = self.sp.created_playlists(user_id)
-        seed_playlists = []
-        skipped = []
-        for pl in created:
-            reason = skip_seed_reason(pl.get("name") or "", today, mix_name)
-            if reason:
-                skipped.append(reason)
-                continue
-            seed_playlists.append(pl)
-
-        print(f"created playlists: {len(created)}")
-        print(f"seed playlists:    {len(seed_playlists)}")
-        for reason in skipped:
-            print(f"  skip seed: {reason}")
 
         exclude: set[str] = set()
-        seeds: Counter = Counter()
         seed_artist_names: Counter = Counter()
+        seed_playlists: list[dict] = []
+        skipped_seeding: list[str] = []
 
-        for pl in seed_playlists:
+        print(f"created playlists: {len(created)}")
+        for pl in created:
+            name = pl.get("name") or ""
+            if output_playlist_reason(name, mix_name):
+                print(f"  skip entirely: {name!r} (our own output)")
+                continue
+
             tracks = self.sp.playlist_items(pl["id"])
-            print(f"  {pl.get('name')!r}: {len(tracks)} tracks")
             for t in tracks:
                 if t.get("id"):
                     exclude.add(t["id"])
+
+            reason = seed_only_skip_reason(name, today)
+            if reason:
+                skipped_seeding.append(reason)
+                print(f"  {name!r}: {len(tracks)} tracks (excludes only — {reason})")
+                continue
+
+            seed_playlists.append(pl)
+            print(f"  {name!r}: {len(tracks)} tracks (seeds + excludes)")
+            for t in tracks:
                 for a in t.get("artists") or []:
-                    if a.get("id"):
-                        seeds[a["id"]] += 1
                     if a.get("name"):
                         seed_artist_names[a["name"]] += 1
 
+        # Likes are always excludes ("likes = seeds + exclude" per the README);
+        # MIX_USE_LIKES only decides whether they also seed.
+        likes = self.sp.liked_tracks()
+        for t in likes:
+            if t.get("id"):
+                exclude.add(t["id"])
         if self.cfg.use_likes:
-            likes = self.sp.liked_tracks()
-            print(f"liked songs (exclude + artist seeds): {len(likes)}")
+            print(f"liked songs (excludes + artist seeds): {len(likes)}")
             for t in likes:
-                if t.get("id"):
-                    exclude.add(t["id"])
                 for a in t.get("artists") or []:
-                    if a.get("id"):
-                        seeds[a["id"]] += 1
                     if a.get("name"):
                         seed_artist_names[a["name"]] += 1
+        else:
+            print(f"liked songs (excludes only): {len(likes)}")
 
+        print(f"seed playlists:    {len(seed_playlists)}")
         exclude |= self.played_ids()
         print(f"exclude track ids: {len(exclude)}")
         return seed_playlists, exclude, seed_artist_names
@@ -792,7 +870,20 @@ class Mixer:
         self._similar_cache[key] = {"ts": int(time.time()), "names": names}
         return names[:limit]
 
+    @staticmethod
+    def _artist_matches(want: str, credited: list[str]) -> bool:
+        """Credited-artist overlap, tolerant of 'feat.' and remaster suffixes."""
+        return any(want == c or want in c or c in want for c in credited if c)
+
     def resolve_track(self, title: str, artist: str) -> dict | None:
+        """Resolve (title, artist) onto a Spotify track, or None.
+
+        None rather than a track by a DIFFERENT artist. The caller scores the
+        result with the REQUESTED artist's Last.fm listener count, so a
+        wrong-artist hit enters the mix carrying someone else's popularity.
+        The unfiltered fallback query below makes that reachable whenever the
+        Last.fm title differs from Spotify's (remaster / "feat." suffixes).
+        """
         q = f'track:"{title}" artist:"{artist}"'
         hits = self.sp.search_tracks(q, limit=5)
         if not hits:
@@ -800,15 +891,17 @@ class Mixer:
         want_t, want_a = title.strip().lower(), artist.strip().lower()
         best = None
         for h in hits:
-            hname = (h.get("name") or "").strip().lower()
-            hans = [x.strip().lower() for x in artist_names(h)]
             if not h.get("id"):
                 continue
-            if hname == want_t and want_a in hans:
+            hname = (h.get("name") or "").strip().lower()
+            hans = [x.strip().lower() for x in artist_names(h)]
+            if not self._artist_matches(want_a, hans):
+                continue
+            if hname == want_t:
                 return h
             if best is None and (want_t in hname or hname in want_t):
                 best = h
-        return best or (hits[0] if hits else None)
+        return best
 
     def popular_tracks_for(self, artist_name: str, n: int = 8) -> list[Candidate]:
         """Top/popular tracks for an artist, resolved onto Spotify."""
@@ -869,7 +962,13 @@ class Mixer:
                 pop = hit.get("popularity")
                 if not isinstance(pop, int):
                     # Search is relevance-ranked; earlier hits ≈ more popular.
-                    pop = max(40, 80 - 3 * i)
+                    # Capped at min_popularity so a GUESS from search rank can
+                    # never outrank a MEASURED score in the same pool: an
+                    # unverified hit used to score 80 against a real
+                    # 10k-listener track's 60. Capped at the gate, not below
+                    # it — below empties the pool entirely when there is no
+                    # Last.fm key, since then every artist falls to this path.
+                    pop = min(self.cfg.min_popularity, max(40, 80 - 3 * i))
                 found.append(
                     Candidate(
                         track_id=hit["id"],
@@ -961,7 +1060,15 @@ class Mixer:
         picked.sort(key=lambda c: c.popularity, reverse=True)
         return picked
 
-    def persist_mix(self, tracks: list[Candidate], user_id: str) -> dict:
+    def persist_mix(self, tracks: list[Candidate], user_id: str, force: bool = False) -> dict:
+        previous = len(read_json(self.paths.last_mix, {}).get("tracks") or [])
+        floor = int(previous * MIX_MIN_REPLACE_RATIO)
+        if previous and not force and len(tracks) < floor:
+            raise RuntimeError(
+                f"refusing to replace a {previous}-track mix with {len(tracks)}: "
+                f"below the {floor}-track floor. A source is probably rate-limited "
+                f"or down — re-run when it recovers, or pass --force to overwrite."
+            )
         payload = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "user_id": user_id,
@@ -1006,13 +1113,53 @@ def print_mix(tracks: list[Candidate]) -> None:
     print(f"{len(tracks)} tracks")
 
 
+def write_env_value(path: Path, key: str, value: str) -> None:
+    """Set one key in a .env file atomically, preserving its mode.
+
+    Same temp+os.replace as write_json. This file holds SPOTIFY_REFRESH_TOKEN
+    and SPOTIFY_CLIENT_SECRET, and a watch_plays daemon can be rewriting it
+    while a log_plays cron does the same; a truncate-then-write loses it.
+    """
+    if not path.is_file():
+        return
+    lines: list[str] = []
+    seen = False
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if raw.startswith(f"{key}="):
+            lines.append(f"{key}={value}")
+            seen = True
+        else:
+            lines.append(raw)
+    if not seen:
+        lines.append(f"{key}={value}")
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    os.chmod(tmp, path.stat().st_mode & 0o777)
+    tmp.replace(path)
+
+
 def load_client(require_token: bool = True, force_refresh: bool = False) -> Spotify:
+    """Build a Spotify client that can refresh its own token.
+
+    The returned client retries once on 401, so every entry point self-heals
+    from an expired cached token. This is what .env.example has always
+    promised ("If set, refresh is skipped until 401").
+    """
     access = None if force_refresh else env("SPOTIFY_ACCESS_TOKEN")
-    refresh = env("SPOTIFY_REFRESH_TOKEN")
+    refresh_token = env("SPOTIFY_REFRESH_TOKEN")
     cid = env("SPOTIFY_CLIENT_ID")
     secret = env("SPOTIFY_CLIENT_SECRET")
+    can_refresh = bool(cid and secret and refresh_token)
+
+    def mint() -> str:
+        token = refresh_access_token(cid, secret, refresh_token)
+        # Keep a fresh access token so a separate build_mix process does not 401.
+        write_env_value(ROOT / ".env", "SPOTIFY_ACCESS_TOKEN", token)
+        os.environ["SPOTIFY_ACCESS_TOKEN"] = token
+        return token
+
     if not access:
-        if not (cid and secret and refresh):
+        if not can_refresh:
             if require_token:
                 raise SystemExit(
                     "Missing Spotify credentials. Set SPOTIFY_CLIENT_ID, "
@@ -1020,23 +1167,8 @@ def load_client(require_token: bool = True, force_refresh: bool = False) -> Spot
                     f"(see {ROOT / '.env.example'}). This script does not start OAuth."
                 )
             raise SystemExit("no token")
-        access = refresh_access_token(cid, secret, refresh)
-        # Keep a fresh access token so the next call does not 401.
-        env_path = ROOT / ".env"
-        if env_path.is_file():
-            lines = []
-            seen = False
-            for raw in env_path.read_text(encoding="utf-8").splitlines():
-                if raw.startswith("SPOTIFY_ACCESS_TOKEN="):
-                    lines.append(f"SPOTIFY_ACCESS_TOKEN={access}")
-                    seen = True
-                else:
-                    lines.append(raw)
-            if not seen:
-                lines.append(f"SPOTIFY_ACCESS_TOKEN={access}")
-            env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-            os.environ["SPOTIFY_ACCESS_TOKEN"] = access
-    return Spotify(access)
+        access = mint()
+    return Spotify(access, refresh=mint if can_refresh else None)
 
 
 def mix_config_from_env(today: date | None = None) -> MixConfig:
@@ -1050,7 +1182,7 @@ def mix_config_from_env(today: date | None = None) -> MixConfig:
     )
 
 
-def cmd_build_mix(paths: Paths, persist: bool = True) -> list[Candidate]:
+def cmd_build_mix(paths: Paths, persist: bool = True, force: bool = False) -> list[Candidate]:
     sp = load_client()
     cfg = mix_config_from_env()
     lastfm_key = env("LASTFM_API_KEY")
@@ -1064,24 +1196,36 @@ def cmd_build_mix(paths: Paths, persist: bool = True) -> list[Candidate]:
     user = sp.me()
     tracks = mixer.build(user)
     if persist:
-        mixer.persist_mix(tracks, user["id"])
+        mixer.persist_mix(tracks, user["id"], force=force)
         print(f"wrote {paths.last_mix}")
     print_mix(tracks)
     return tracks
 
 
-def cmd_publish(paths: Paths, dry_run: bool = False) -> None:
+def cmd_publish(paths: Paths, dry_run: bool = False, force: bool = False) -> None:
     cfg = mix_config_from_env()
     last = read_json(paths.last_mix, {})
     tracks = last.get("tracks") or []
     if len(tracks) < 1:
         print("no last_mix.json — running build_mix first")
-        cmd_build_mix(paths)
+        cmd_build_mix(paths, force=force)
         last = read_json(paths.last_mix, {})
         tracks = last.get("tracks") or []
     uris = [t["uri"] for t in tracks if t.get("uri")]
     if not uris:
         raise SystemExit("last mix has no track URIs")
+
+    # Same floor as persist_mix: replacing the live playlist is destructive and
+    # maybe_refresh does it unattended, so a thin build must not overwrite a
+    # full one just because it produced at least one URI.
+    published = read_json(paths.config, {}).get("track_count") or 0
+    floor = int(published * MIX_MIN_REPLACE_RATIO)
+    if published and not force and len(uris) < floor:
+        raise SystemExit(
+            f"refusing to replace a {published}-track playlist with {len(uris)}: "
+            f"below the {floor}-track floor. Re-run when sources recover, "
+            f"or pass --force."
+        )
 
     description = (
         "Agent mix of popular new-to-you tracks. Seeded from playlists you created "
@@ -1125,6 +1269,7 @@ def cmd_publish(paths: Paths, dry_run: bool = False) -> None:
             "playlist_uri": f"spotify:playlist:{playlist_id}",
             "user_id": user["id"],
             "name": cfg.playlist_name,
+            "track_count": len(uris),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
@@ -1135,19 +1280,51 @@ def cmd_publish(paths: Paths, dry_run: bool = False) -> None:
     print(f"published {len(uris)} tracks → {config['playlist_uri']}")
 
 
+def _age_days(stamp: str | None) -> float | None:
+    if not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - when).total_seconds() / 86400.0
+
+
 def mix_heard_progress(paths: Paths) -> dict:
-    """How many of this week's mix tracks are in the heard log."""
+    """How much of this week's mix has been heard, and may it be replaced yet.
+
+    "Finished" is not "every track heard": one region-locked, removed, or
+    relinked track would wedge maybe_refresh permanently. A mix also counts as
+    finished once MIX_HEARD_RATIO of it is heard, or once it is simply old.
+    """
     last = read_json(paths.last_mix, {})
     tracks = [t for t in (last.get("tracks") or []) if t.get("id")]
     mix_ids = {t["id"] for t in tracks}
     played = read_json(paths.played, {"plays": []})
     heard = _heard_ids(played) & mix_ids
     missing = [t for t in tracks if t["id"] not in heard]
+    ratio = (len(heard) / len(mix_ids)) if mix_ids else 0.0
+    age = _age_days(last.get("published_at"))
+
+    reason = None
+    if mix_ids:
+        if not missing:
+            reason = "all heard"
+        elif ratio >= MIX_HEARD_RATIO:
+            reason = f"{ratio:.0%} heard (>= {MIX_HEARD_RATIO:.0%})"
+        elif age is not None and age >= MIX_MAX_AGE_DAYS:
+            reason = f"published {age:.0f}d ago (>= {MIX_MAX_AGE_DAYS}d)"
+
     return {
         "mix_size": len(mix_ids),
         "heard": len(heard),
         "remaining": len(missing),
-        "finished": bool(mix_ids) and not missing,
+        "heard_ratio": ratio,
+        "age_days": age,
+        "finished": reason is not None,
+        "finished_reason": reason,
         "published_at": last.get("published_at"),
         "playlist_id": last.get("playlist_id"),
         "missing_names": [t.get("name") for t in missing],
@@ -1155,10 +1332,12 @@ def mix_heard_progress(paths: Paths) -> dict:
 
 
 def cmd_maybe_refresh(paths: Paths) -> int:
-    """If this week's mix is fully heard, build and overwrite a new one.
+    """If this week's mix is used up, build and publish a replacement.
 
     Prints MIX_FINISHED then NEW_MIX so callers know to ping Zach.
-    No-op if any mix track is still unheard.
+    "Used up" is all-heard, mostly-heard, or simply old — see
+    mix_heard_progress. With no mix at all, bootstraps one rather than
+    no-opping forever.
     """
     prog = mix_heard_progress(paths)
     print(
@@ -1166,12 +1345,12 @@ def cmd_maybe_refresh(paths: Paths) -> int:
         f"{prog['remaining']} remaining"
     )
     if not prog["mix_size"]:
-        print("no current mix")
-        return 0
-    if not prog["finished"]:
+        print("no current mix — building the first one")
+    elif not prog["finished"]:
         print("mix still open")
         return 0
-    print("MIX_FINISHED")
+    else:
+        print(f"MIX_FINISHED ({prog['finished_reason']})")
     cmd_build_mix(paths)
     cmd_publish(paths)
     last = read_json(paths.last_mix, {})
@@ -1243,14 +1422,9 @@ def harvest_plays(
 
     current = None
     if include_current:
-        try:
-            current = sp.currently_playing()
-        except RuntimeError as exc:
-            if "401" in str(exc):
-                sp = load_client(force_refresh=True)
-                current = sp.currently_playing()
-            else:
-                raise
+        # No 401 handling here: Spotify refreshes and retries internally, so a
+        # 401 that reaches us is a real auth failure, not an expired token.
+        current = sp.currently_playing()
     if current:
         item = current.get("item") or current.get("track") or {}
         ctx = current.get("context") or {}
@@ -1277,14 +1451,7 @@ def harvest_plays(
 
     items: list = []
     if include_recent:
-        try:
-            items = sp.recently_played(limit=50)
-        except RuntimeError as exc:
-            if "401" in str(exc):
-                sp = load_client(force_refresh=True)
-                items = sp.recently_played(limit=50)
-            else:
-                raise
+        items = sp.recently_played(limit=50)
         for row in items:
             track = row.get("track") or row.get("item") or {}
             tid = track.get("id")
@@ -1354,7 +1521,9 @@ def ingest_ui_nowplaying(paths: Paths) -> dict:
         artists = [_norm(a) for a in (t.get("artists") or [])]
         if not title or not t.get("id"):
             continue
-        by_key[title] = t
+        # Keyed by title AND artist only. A title-alone key marks the wrong
+        # track heard whenever two songs share a name ("Alive", "Home",
+        # "Stay"), which permanently excludes a track you never played.
         for a in artists:
             by_key[f"{title}|{a}"] = t
     played = read_json(paths.played, {"plays": []})
@@ -1382,8 +1551,6 @@ def ingest_ui_nowplaying(paths: Paths) -> dict:
             hit = by_key.get(f"{title}|{a}")
             if hit:
                 break
-        if not hit:
-            hit = by_key.get(title)
         if not hit:
             continue
         ts = row.get("ts") or datetime.now(timezone.utc).isoformat()
@@ -1476,19 +1643,8 @@ def cmd_probe(paths: Paths) -> None:
     print(f"  recommendations:     {caps.recommendations}")
     print(f"  artist top-tracks:   {caps.artist_top_tracks}")
     print(f"  popularity field:    {caps.popularity_field}")
-    write_json(
-        paths.state / "probe.json",
-        {
-            "probed_at": datetime.now(timezone.utc).isoformat(),
-            "user_id": me.get("id"),
-            "caps": {
-                "related_artists": caps.related_artists,
-                "recommendations": caps.recommendations,
-                "artist_top_tracks": caps.artist_top_tracks,
-                "popularity_field": caps.popularity_field,
-            },
-        },
-    )
+    # Deliberately NOT persisted: nothing ever read probe.json back, and the
+    # caps self-disable after the first 4xx within a process anyway.
 
 
 def cmd_self_test() -> int:
@@ -1523,6 +1679,167 @@ def cmd_self_test() -> int:
     check(skip_seed_reason("Deep Cuts", today, "Weekly Mix") is None, "normal playlist kept")
     check(lastfm_listeners_to_popularity(3200) >= 50, "Last.fm ~3k listeners maps near 55")
     check(lastfm_listeners_to_popularity(1_000_000) >= 85, "Last.fm 1M listeners maps high")
+
+    # ---------------------------------------------------------------- regressions
+    # One per defect found in the 2026-09-02 review. Each of these failed
+    # before its fix. Still no network: small fakes, no requests.Session use.
+
+    class _Resp:
+        def __init__(self, code: int, payload: Any = None) -> None:
+            self.status_code = code
+            self._p = payload
+            self.text = json.dumps(payload or {})
+            self.headers: dict = {}
+
+        def json(self) -> Any:
+            if self._p is None:
+                raise ValueError("no json")
+            return self._p
+
+    class _Session:
+        """Answers 401 until the Authorization header carries FRESH."""
+
+        def __init__(self) -> None:
+            self.headers: dict = {}
+            self.calls = 0
+
+        def request(self, method: str, url: str, **kw: Any) -> Any:
+            self.calls += 1
+            if self.headers.get("Authorization") == "Bearer FRESH":
+                return _Resp(200, {"id": "u1"})
+            return _Resp(401, {"error": {"status": 401}})
+
+    # 1. An expired cached token self-heals on any entry point, once.
+    minted = []
+    sp = Spotify("STALE", refresh=lambda: (minted.append(1), "FRESH")[1])
+    sp.http.s = _Session()
+    sp._set_token("STALE")
+    check(sp.me().get("id") == "u1", "401 is retried once with a refreshed token")
+    check(len(minted) == 1, "a stale token mints exactly one replacement")
+
+    sp_noref = Spotify("STALE")
+    sp_noref.http.s = _Session()
+    sp_noref._set_token("STALE")
+    check(sp_noref.get_ok("/me")[0] == 401, "without credentials a 401 stays a 401")
+
+    # 2. A thin rebuild cannot destroy the record of a good mix.
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        write_json(p.last_mix, {"tracks": [{"id": f"T{i}"} for i in range(40)]})
+        mx = Mixer.__new__(Mixer)
+        mx.paths, mx.cfg = p, MixConfig()
+        thin = [Candidate("x", "spotify:track:x", "n", ["a"], ["ai"], 60, "s")]
+        try:
+            Mixer.persist_mix(mx, thin, "u1")
+            check(False, "persist_mix refuses a materially smaller mix")
+        except RuntimeError:
+            check(True, "persist_mix refuses a materially smaller mix")
+        Mixer.persist_mix(mx, thin, "u1", force=True)
+        check(
+            len(read_json(p.last_mix, {})["tracks"]) == 1,
+            "persist_mix --force still overwrites",
+        )
+
+    # 3. maybe_refresh cannot be wedged by one unplayable track.
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        write_json(p.last_mix, {"tracks": [{"id": f"T{i}"} for i in range(40)]})
+        write_json(p.played, {"plays": [{"track_id": f"T{i}"} for i in range(39)]})
+        check(mix_heard_progress(p)["finished"], "39/40 heard counts as finished")
+        write_json(p.played, {"plays": [{"track_id": "T0"}]})
+        check(not mix_heard_progress(p)["finished"], "1/40 heard does not")
+        old = (datetime.now(timezone.utc) - timedelta(days=MIX_MAX_AGE_DAYS + 1)).isoformat()
+        write_json(
+            p.last_mix,
+            {"tracks": [{"id": f"T{i}"} for i in range(40)], "published_at": old},
+        )
+        check(mix_heard_progress(p)["finished"], "an old mix ages out even if unheard")
+
+    # 4. Skipping a playlist for SEEDING still contributes its excludes.
+    class _FakeSp:
+        caps = SpotifyCaps()
+
+        def created_playlists(self, uid: str) -> list[dict]:
+            return [
+                {"id": "kids", "name": "Kid A"},
+                {"id": "good", "name": "Deep Cuts"},
+                {"id": "mine", "name": "Weekly Mix"},
+            ]
+
+        def playlist_items(self, pid: str) -> list[dict]:
+            return [{"id": f"{pid}-t", "artists": [{"id": f"{pid}-a", "name": f"{pid}Artist"}]}]
+
+        def liked_tracks(self) -> list[dict]:
+            return [{"id": "liked-t", "artists": [{"id": "liked-a", "name": "LikedArtist"}]}]
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        mx = Mixer.__new__(Mixer)
+        mx.sp, mx.paths, mx.cfg = _FakeSp(), p, MixConfig(today=today)
+        _, exclude, names = Mixer.collect_library(mx, "u1")
+        check("kids-t" in exclude, "a kids playlist still contributes excludes")
+        check("kidsArtist" not in names, "a kids playlist contributes no seeds")
+        check("good-t" in exclude and "goodArtist" in names, "a normal playlist does both")
+        check("mine-t" not in exclude, "our own output playlist is skipped entirely")
+        check("liked-t" in exclude, "likes contribute excludes")
+
+    # 5. A search-rank guess never outranks a measured score, and never
+    #    empties the pool by falling under the gate.
+    cfg55 = MixConfig(min_popularity=55)
+    ramp = [min(cfg55.min_popularity, max(40, 80 - 3 * i)) for i in range(10)]
+    check(max(ramp) <= cfg55.min_popularity, "Path C never scores above min_popularity")
+    check(any(v >= cfg55.min_popularity for v in ramp), "Path C still clears the gate")
+    check(
+        lastfm_listeners_to_popularity(100_000) > max(ramp),
+        "a measured 100k-listener track outranks any search guess",
+    )
+
+    # 6. A cover by another artist is dropped, not substituted.
+    class _SearchSp:
+        caps = SpotifyCaps()
+
+        def __init__(self, artists: list[str]) -> None:
+            self._artists = artists
+
+        def search_tracks(self, q: str, limit: int = 5) -> list[dict]:
+            return [
+                {
+                    "id": "H",
+                    "uri": "spotify:track:H",
+                    "name": "Blue Monday",
+                    "artists": [{"id": "a", "name": n}],
+                }
+                for n in self._artists
+            ]
+
+    mx = Mixer.__new__(Mixer)
+    mx.sp, mx.cfg = _SearchSp(["Orgy"]), MixConfig()
+    check(
+        Mixer.resolve_track(mx, "Blue Monday", "New Order") is None,
+        "resolve_track drops a hit by the wrong artist",
+    )
+    mx.sp = _SearchSp(["New Order"])
+    check(
+        (Mixer.resolve_track(mx, "Blue Monday", "New Order") or {}).get("id") == "H",
+        "resolve_track still accepts the right artist",
+    )
+
+    # 7. An unreadable playlist is loud, not silently empty.
+    class _ForbiddenSession:
+        def __init__(self) -> None:
+            self.headers: dict = {}
+
+        def request(self, method: str, url: str, **kw: Any) -> Any:
+            return _Resp(403, {"error": {"status": 403}})
+
+    sp403 = Spotify("t")
+    sp403.http.s = _ForbiddenSession()
+    try:
+        sp403.playlist_items("p1")
+        check(False, "playlist_items raises instead of returning []")
+    except RuntimeError:
+        check(True, "playlist_items raises instead of returning []")
+
     print("self_test failures:", failures)
     return 1 if failures else 0
 
@@ -1532,9 +1849,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--state-dir", default=str(DEFAULT_STATE))
     p.add_argument("--env-file", default=str(ROOT / ".env"))
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("build_mix", help="compute ~40 tracks and print them")
+    bld = sub.add_parser("build_mix", help="compute ~40 tracks and print them")
+    bld.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite last_mix.json even with a much smaller mix",
+    )
     pub = sub.add_parser("publish", help="create or replace the Weekly Mix playlist")
     pub.add_argument("--dry-run", action="store_true", help="print URIs; do not touch Spotify playlists")
+    pub.add_argument(
+        "--force",
+        action="store_true",
+        help="replace the playlist even with a much smaller mix",
+    )
     logp = sub.add_parser("log_plays", help="record heard mix tracks (now-playing + recently-played)")
     logp.add_argument(
         "--recent-only",
@@ -1593,10 +1920,10 @@ def main(argv: list[str] | None = None) -> int:
         print("This script does not start a server or exchange the code.")
         return 0
     if args.cmd == "build_mix":
-        cmd_build_mix(paths)
+        cmd_build_mix(paths, force=args.force)
         return 0
     if args.cmd == "publish":
-        cmd_publish(paths, dry_run=args.dry_run)
+        cmd_publish(paths, dry_run=args.dry_run, force=args.force)
         return 0
     if args.cmd == "log_plays":
         cmd_log_plays(paths, recent_only=args.recent_only)
