@@ -19,13 +19,14 @@ popularity field in Feb 2026):
     → Last.fm artist.getSimilar  (or ListenBrainz similar-artists)
     → those artists' popular tracks (Last.fm top-tracks, or Spotify search)
     → drop anything already in created playlists, likes, or the play log
-    → keep ~40, biased to popular, max N per artist
+    → drop sleep/ambient/rain-mill titles and unusable seed names
+    → keep ~40, biased to popular, max N per artist, cap Path C guesses
 
 Commands: build_mix | publish | log_plays | watch_plays | ingest_ui |
           maybe_refresh | probe | print_auth_url | self_test
 
-This script does not register a Spotify app and does not start OAuth;
-oauth.py is the separate, opt-in helper that does.
+Business logic: docs/ALGORITHM.md. This script does not register a Spotify
+app and does not start OAuth; oauth.py is the separate, opt-in helper that does.
 """
 
 from __future__ import annotations
@@ -161,6 +162,150 @@ def seed_only_skip_reason(name: str, today: date) -> str | None:
 def skip_seed_reason(name: str, today: date, mix_name: str) -> str | None:
     """True when a playlist contributes no seed artists, for any reason."""
     return output_playlist_reason(name, mix_name) or seed_only_skip_reason(name, today)
+
+
+# ---------------------------------------------------------------------------
+# Discovery quality: artist resolve, junk titles, short names
+# ---------------------------------------------------------------------------
+
+MIN_ARTIST_NAME_LEN = 3
+
+# Names that resolve to the wrong catalog entry or are not taste. Length < 3
+# is already refused; this list catches the rest (common English words and
+# credit-line leftovers). "Py" is length 2 so the length rule covers it.
+BLOCKED_ARTIST_NAMES = frozenset(
+    {
+        "the",
+        "and",
+        "you",
+        "me",
+        "we",
+        "it",
+        "he",
+        "she",
+        "a",
+        "an",
+        "of",
+        "to",
+        "for",
+        "my",
+        "our",
+        "your",
+        "dj",
+        "mc",
+        "vs",
+        "remix",
+        "mix",
+        "edit",
+        "live",
+        "feat",
+        "featuring",
+        "various",
+        "various artists",
+        "unknown",
+        "artist",
+    }
+)
+
+# Sleep / ambient mill leakage. Compound rain/thunder phrases, not the
+# standalone hit titles "Rain" or "Thunder".
+JUNK_DISCOVERY_RE = re.compile(
+    r"""
+    (?:white|brown|pink)[\s-]*noise |
+    pure\s+sleeping |
+    sleep(?:ing)?[\s-]*(?:music|sounds?|vibes?|playlist|aid) |
+    lullab(?:y|ies) |
+    \bspa\b |
+    \bmassage\b |
+    \byoga\b |
+    \bmeditation\b |
+    432\s*hz |
+    lo-?fi[\s-]+(?:study|beats|hip[\s-]*hop) |
+    rain[\s-]+(?:on(?:\s+the)?\s+roof|sounds?|and[\s-]+thunder) |
+    thunder[\s-]+(?:and[\s-]+rain|sounds?|rain) |
+    soothing(?:[\s-]+(?:sleep|rain|ambient|music|sounds?|vibes?))? |
+    nature[\s-]+sounds? |
+    ambient(?:[\s-]+(?:sleep|music|rain|sounds?|noise))?
+    """,
+    re.I | re.X,
+)
+
+_FEAT_SUFFIX_RE = re.compile(
+    r"\s+(feat\.?|ft\.?|featuring|with)\s+.+$",
+    re.I,
+)
+
+# Path C may only take this many top search hits per artist. Rank 0 is first.
+PATH_C_MAX_RANK = 3
+
+
+def normalize_artist_name(name: str) -> str:
+    """Fold case, punctuation, and '&' / 'and' for artist comparison."""
+    s = (name or "").strip().lower().replace("&", " and ")
+    s = re.sub(r"[^\w\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def is_usable_artist_name(name: str) -> bool:
+    """Refuse seeds/searches that resolve badly (too short or blocked words)."""
+    raw = (name or "").strip()
+    if len(raw) < MIN_ARTIST_NAME_LEN:
+        return False
+    norm = normalize_artist_name(raw)
+    if len(norm) < MIN_ARTIST_NAME_LEN:
+        return False
+    return norm not in BLOCKED_ARTIST_NAMES
+
+
+def is_junk_discovery(title: str, artists: list[str] | None = None) -> bool:
+    """True when a title or credited artist is sleep/ambient/rain-mill junk."""
+    blobs = [title or ""]
+    blobs.extend(artists or [])
+    return any(JUNK_DISCOVERY_RE.search(blob) for blob in blobs if blob)
+
+
+def primary_artist_matches(want: str, primary: str) -> bool:
+    """True when the Spotify primary artist is the requested artist.
+
+    Exact match after normalize. A feat./ft./with suffix on the primary is
+    stripped so 'The National feat. X' still matches 'The National'.
+    Extra words that are not a featuring credit are a different artist:
+    'The National Forest' does not match 'The National'.
+    """
+    w = normalize_artist_name(want)
+    p = normalize_artist_name(primary)
+    if not w or not p:
+        return False
+    p_core = _FEAT_SUFFIX_RE.sub("", p).strip()
+    return w == p or w == p_core
+
+
+def path_c_guessed_popularity(rank: int, min_popularity: int) -> int:
+    """Search-rank guess on Spotify's 0–100 scale.
+
+    Rank 0 is strongest. Never above min_popularity, so a guess cannot
+    outrank a measured Last.fm/Spotify score at the same number. Top ranks
+    still equal the gate so a Last.fm-less run still has a pool. The mix
+    must not treat these as interchangeable with Path A: sort them below
+    measured scores and cap how many make the final 40.
+    """
+    return min(min_popularity, max(40, 80 - 3 * rank))
+
+
+def qualify_seed_artists(counts: Counter, min_count: int) -> Counter:
+    """Drop one-off primary artists unless that would empty the seed set."""
+    if min_count <= 1:
+        return counts
+    kept = Counter({name: n for name, n in counts.items() if n >= min_count})
+    return kept if kept else counts
+
+
+def primary_artist_name(track: dict) -> str | None:
+    artists = track.get("artists") or []
+    if not artists:
+        return None
+    name = (artists[0].get("name") or "").strip()
+    return name or None
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +792,27 @@ class LastFm:
             )
         return out
 
+    def track_info(self, track: str, artist: str) -> dict | None:
+        """Last.fm track.getInfo listener count, or None if missing."""
+        data = self._call(
+            "track.getInfo",
+            track=track,
+            artist=artist,
+            autocorrect="1",
+        )
+        row = data.get("track") if isinstance(data, dict) else None
+        if not isinstance(row, dict):
+            return None
+        name = (row.get("name") or "").strip()
+        if not name:
+            return None
+        try:
+            listeners = int(row.get("listeners") or 0)
+        except (TypeError, ValueError):
+            listeners = 0
+        credited = ((row.get("artist") or {}).get("name")) or artist
+        return {"name": name, "artist": credited, "listeners": listeners}
+
 
 class MusicBrainz:
     def __init__(self) -> None:
@@ -731,6 +897,8 @@ class Candidate:
     artist_ids: list[str]
     popularity: int
     source: str
+    # False = Path C search-rank guess with no Last.fm/Spotify measurement.
+    measured: bool = True
 
 
 @dataclass
@@ -740,6 +908,8 @@ class MixConfig:
     min_popularity: int = 55
     max_per_artist: int = 2
     use_likes: bool = True
+    min_seed_count: int = 2
+    max_path_c: int = 10
     today: date = field(default_factory=lambda: date.today())
 
 
@@ -753,6 +923,65 @@ def artist_ids(track: dict) -> list[str]:
 
 def track_uri(track: dict) -> str:
     return track.get("uri") or f"spotify:track:{track['id']}"
+
+
+def _primary_key(c: Candidate) -> str:
+    return c.artist_ids[0] if c.artist_ids else (c.artists[0] if c.artists else c.track_id)
+
+
+def _weighted_pick(
+    pool: list[Candidate],
+    need: int,
+    rng: random.Random,
+    per_artist: Counter,
+    max_per_artist: int,
+) -> list[Candidate]:
+    picked: list[Candidate] = []
+    remaining = pool[:]
+    while remaining and len(picked) < need:
+        eligible: list[Candidate] = []
+        weights: list[float] = []
+        for c in remaining:
+            if per_artist[_primary_key(c)] >= max_per_artist:
+                continue
+            eligible.append(c)
+            weights.append(max(1, c.popularity) ** 1.4)
+        if not eligible:
+            break
+        choice = rng.choices(eligible, weights=weights, k=1)[0]
+        picked.append(choice)
+        per_artist[_primary_key(choice)] += 1
+        remaining = [c for c in remaining if c.track_id != choice.track_id]
+    return picked
+
+
+def select_mix_tracks(
+    pool: list[Candidate],
+    *,
+    size: int,
+    max_per_artist: int,
+    max_path_c: int,
+    rng: random.Random,
+) -> list[Candidate]:
+    """Pick the final mix. Measured Path A/B first; Path C guesses capped.
+
+    Path C search-rank guesses all tend to land on the same popularity (the
+    gate). Without a separate tier they flood a 40-track mix. Measured tracks
+    are always preferred; guessed tracks fill remaining slots up to max_path_c.
+    """
+    measured = [c for c in pool if c.measured]
+    guessed = [c for c in pool if not c.measured]
+    measured.sort(key=lambda c: c.popularity, reverse=True)
+    guessed.sort(key=lambda c: c.popularity, reverse=True)
+
+    per_artist: Counter = Counter()
+    picked = _weighted_pick(measured, size, rng, per_artist, max_per_artist)
+    if len(picked) < size and guessed:
+        need = min(max_path_c, size - len(picked))
+        picked.extend(_weighted_pick(guessed, need, rng, per_artist, max_per_artist))
+
+    picked.sort(key=lambda c: (0 if c.measured else 1, -c.popularity))
+    return picked
 
 
 class Mixer:
@@ -821,9 +1050,7 @@ class Mixer:
             seed_playlists.append(pl)
             print(f"  {name!r}: {len(tracks)} tracks (seeds + excludes)")
             for t in tracks:
-                for a in t.get("artists") or []:
-                    if a.get("name"):
-                        seed_artist_names[a["name"]] += 1
+                self._count_primary_seed(seed_artist_names, t)
 
         # Likes are always excludes ("likes = seeds + exclude" per the README);
         # MIX_USE_LIKES only decides whether they also seed.
@@ -834,9 +1061,7 @@ class Mixer:
         if self.cfg.use_likes:
             print(f"liked songs (excludes + artist seeds): {len(likes)}")
             for t in likes:
-                for a in t.get("artists") or []:
-                    if a.get("name"):
-                        seed_artist_names[a["name"]] += 1
+                self._count_primary_seed(seed_artist_names, t)
         else:
             print(f"liked songs (excludes only): {len(likes)}")
 
@@ -844,6 +1069,13 @@ class Mixer:
         exclude |= self.played_ids()
         print(f"exclude track ids: {len(exclude)}")
         return seed_playlists, exclude, seed_artist_names
+
+    @staticmethod
+    def _count_primary_seed(dest: Counter, track: dict) -> None:
+        """Count the primary artist only. Featured / remix credits do not seed."""
+        name = primary_artist_name(track)
+        if name and is_usable_artist_name(name):
+            dest[name] += 1
 
     def similar_for(self, artist_name: str, limit: int = 10) -> list[str]:
         key = artist_name.strip().lower()
@@ -867,50 +1099,82 @@ class Mixer:
                 rel = self.sp.related_artists(sp_artist["id"])
                 names = [a.get("name") for a in rel if a.get("name")][:limit]
 
+        names = [n for n in names if is_usable_artist_name(n)]
         self._similar_cache[key] = {"ts": int(time.time()), "names": names}
         return names[:limit]
-
-    @staticmethod
-    def _artist_matches(want: str, credited: list[str]) -> bool:
-        """Credited-artist overlap, tolerant of 'feat.' and remaster suffixes."""
-        return any(want == c or want in c or c in want for c in credited if c)
 
     def resolve_track(self, title: str, artist: str) -> dict | None:
         """Resolve (title, artist) onto a Spotify track, or None.
 
-        None rather than a track by a DIFFERENT artist. The caller scores the
-        result with the REQUESTED artist's Last.fm listener count, so a
-        wrong-artist hit enters the mix carrying someone else's popularity.
-        The unfiltered fallback query below makes that reachable whenever the
-        Last.fm title differs from Spotify's (remaster / "feat." suffixes).
+        The primary Spotify artist must be the requested artist (normalized).
+        'The National Forest' is not 'The National'. A fuzzy credited-artist
+        contains check used to accept that. Junk sleep/rain titles are dropped
+        here, not after they have already been scored.
         """
+        if not is_usable_artist_name(artist):
+            return None
         q = f'track:"{title}" artist:"{artist}"'
         hits = self.sp.search_tracks(q, limit=5)
         if not hits:
             hits = self.sp.search_tracks(f"{title} {artist}", limit=5)
-        want_t, want_a = title.strip().lower(), artist.strip().lower()
-        best = None
+        want_t = title.strip().lower()
+        exact = None
+        starts = None
         for h in hits:
             if not h.get("id"):
                 continue
-            hname = (h.get("name") or "").strip().lower()
-            hans = [x.strip().lower() for x in artist_names(h)]
-            if not self._artist_matches(want_a, hans):
+            credited = artist_names(h)
+            if not credited or not primary_artist_matches(artist, credited[0]):
                 continue
-            if hname == want_t:
-                return h
-            if best is None and (want_t in hname or hname in want_t):
-                best = h
-        return best
+            hname = (h.get("name") or "").strip()
+            if is_junk_discovery(hname, credited):
+                continue
+            h_l = hname.lower()
+            if h_l == want_t:
+                exact = h
+                break
+            if starts is None and (h_l.startswith(want_t) or want_t.startswith(h_l)):
+                starts = h
+        return exact or starts
+
+    def _candidate_from_hit(
+        self,
+        hit: dict,
+        *,
+        artist_name: str,
+        popularity: int,
+        source: str,
+        measured: bool,
+    ) -> Candidate | None:
+        if not hit.get("id"):
+            return None
+        name = hit.get("name") or ""
+        artists = artist_names(hit) or [artist_name]
+        if is_junk_discovery(name, artists):
+            return None
+        return Candidate(
+            track_id=hit["id"],
+            uri=track_uri(hit),
+            name=name,
+            artists=artists,
+            artist_ids=artist_ids(hit),
+            popularity=popularity,
+            source=source,
+            measured=measured,
+        )
 
     def popular_tracks_for(self, artist_name: str, n: int = 8) -> list[Candidate]:
         """Top/popular tracks for an artist, resolved onto Spotify."""
+        if not is_usable_artist_name(artist_name):
+            return []
         found: list[Candidate] = []
 
         # Path A: Last.fm ranking (best popularity proxy when Spotify
         # popularity is stripped in Dev Mode).
         if self.lastfm:
             for row in self.lastfm.top_tracks(artist_name, limit=n):
+                if is_junk_discovery(row["name"], [row["artist"], artist_name]):
+                    continue
                 pop = lastfm_listeners_to_popularity(row["listeners"])
                 hit = self.resolve_track(row["name"], row["artist"])
                 if not hit:
@@ -919,67 +1183,84 @@ class Mixer:
                 if isinstance(sp_pop, int):
                     self.sp.caps.popularity_field = True
                     pop = sp_pop
-                found.append(
-                    Candidate(
-                        track_id=hit["id"],
-                        uri=track_uri(hit),
-                        name=hit.get("name") or row["name"],
-                        artists=artist_names(hit) or [artist_name],
-                        artist_ids=artist_ids(hit),
-                        popularity=pop,
-                        source=f"lastfm-top:{artist_name}",
-                    )
+                cand = self._candidate_from_hit(
+                    hit,
+                    artist_name=artist_name,
+                    popularity=pop,
+                    source=f"lastfm-top:{artist_name}",
+                    measured=True,
                 )
+                if cand:
+                    found.append(cand)
 
         # Path B: Spotify artist top-tracks (extended quota / grandfathered).
         if len(found) < n and self.sp.caps.artist_top_tracks is not False:
             sp_artist = self.sp.search_artist(artist_name)
             if sp_artist and sp_artist.get("id"):
                 for hit in self.sp.artist_top_tracks(sp_artist["id"]):
-                    if not hit.get("id"):
-                        continue
                     pop = hit.get("popularity")
                     if not isinstance(pop, int):
                         pop = 60  # endpoint exists ⇒ these ARE the popular ones
-                    found.append(
-                        Candidate(
-                            track_id=hit["id"],
-                            uri=track_uri(hit),
-                            name=hit.get("name") or "",
-                            artists=artist_names(hit) or [artist_name],
-                            artist_ids=artist_ids(hit),
-                            popularity=pop,
-                            source=f"spotify-top:{artist_name}",
-                        )
+                    cand = self._candidate_from_hit(
+                        hit,
+                        artist_name=artist_name,
+                        popularity=pop,
+                        source=f"spotify-top:{artist_name}",
+                        measured=True,
                     )
+                    if cand:
+                        found.append(cand)
 
         # Path C: Spotify search ranking ≈ popularity (Dev Mode fallback).
+        # Only when A/B produced almost nothing. Search-rank guesses all used
+        # to land on exactly min_popularity (55) and flood the final 40.
         if len(found) < 3:
             hits = self.sp.search_tracks(f'artist:"{artist_name}"', limit=10)
             for i, hit in enumerate(hits):
-                if not hit.get("id"):
+                if i >= PATH_C_MAX_RANK:
+                    break
+                credited = artist_names(hit)
+                if not credited or not primary_artist_matches(artist_name, credited[0]):
                     continue
                 pop = hit.get("popularity")
-                if not isinstance(pop, int):
-                    # Search is relevance-ranked; earlier hits ≈ more popular.
-                    # Capped at min_popularity so a GUESS from search rank can
-                    # never outrank a MEASURED score in the same pool: an
-                    # unverified hit used to score 80 against a real
-                    # 10k-listener track's 60. Capped at the gate, not below
-                    # it — below empties the pool entirely when there is no
-                    # Last.fm key, since then every artist falls to this path.
-                    pop = min(self.cfg.min_popularity, max(40, 80 - 3 * i))
-                found.append(
-                    Candidate(
-                        track_id=hit["id"],
-                        uri=track_uri(hit),
-                        name=hit.get("name") or "",
-                        artists=artist_names(hit) or [artist_name],
-                        artist_ids=artist_ids(hit),
+                if isinstance(pop, int):
+                    self.sp.caps.popularity_field = True
+                    cand = self._candidate_from_hit(
+                        hit,
+                        artist_name=artist_name,
                         popularity=pop,
                         source=f"spotify-search:{artist_name}",
+                        measured=True,
                     )
+                    if cand:
+                        found.append(cand)
+                    continue
+                # No Spotify popularity field (Dev Mode). Prefer a Last.fm
+                # listener count over a search-rank guess.
+                if self.lastfm:
+                    info = self.lastfm.track_info(hit.get("name") or "", credited[0])
+                    listeners = (info or {}).get("listeners") or 0
+                    if listeners <= 0:
+                        continue
+                    cand = self._candidate_from_hit(
+                        hit,
+                        artist_name=artist_name,
+                        popularity=lastfm_listeners_to_popularity(listeners),
+                        source=f"lastfm-info:{artist_name}",
+                        measured=True,
+                    )
+                    if cand:
+                        found.append(cand)
+                    continue
+                cand = self._candidate_from_hit(
+                    hit,
+                    artist_name=artist_name,
+                    popularity=path_c_guessed_popularity(i, self.cfg.min_popularity),
+                    source=f"spotify-search:{artist_name}",
+                    measured=False,
                 )
+                if cand:
+                    found.append(cand)
 
         # de-dupe preserving order
         seen: set[str] = set()
@@ -993,7 +1274,13 @@ class Mixer:
 
     def build(self, user: dict) -> list[Candidate]:
         user_id = user["id"]
-        _, exclude, seed_names = self.collect_library(user_id)
+        _, exclude, raw_seeds = self.collect_library(user_id)
+        seed_names = qualify_seed_artists(raw_seeds, self.cfg.min_seed_count)
+        if seed_names is not raw_seeds:
+            print(
+                f"seed artists after min count {self.cfg.min_seed_count}: "
+                f"{len(seed_names)} (from {len(raw_seeds)} unique primaries)"
+            )
         if not seed_names:
             raise RuntimeError("no seed artists — create some playlists first")
 
@@ -1003,6 +1290,8 @@ class Mixer:
         similar: Counter = Counter()
         for name in top_seeds:
             for rel in self.similar_for(name, limit=8):
+                if not is_usable_artist_name(rel):
+                    continue
                 if rel.strip().lower() == name.strip().lower():
                     continue
                 similar[rel] += 1
@@ -1018,13 +1307,36 @@ class Mixer:
         year, week, _ = self.cfg.today.isocalendar()
         rng = random.Random(f"{year}-W{week:02d}-{user_id}")
 
+        by_artist: list[tuple[str, list[Candidate]]] = []
+        for artist in similar_ranked:
+            if not is_usable_artist_name(artist):
+                continue
+            by_artist.append((artist, self.popular_tracks_for(artist, n=8)))
+            n_cands = sum(len(cs) for _, cs in by_artist)
+            if n_cands >= self.cfg.size * 8:
+                break
+
+        measured_groups = [(a, cs) for a, cs in by_artist if any(c.measured for c in cs)]
+        guess_groups = [(a, cs) for a, cs in by_artist if not any(c.measured for c in cs)]
+        # Prefer artists that produced Path A/B (or Last.fm-verified) tracks.
+        # Path-C-only artists are consulted only if the measured pool is thin.
+        ordered_groups = measured_groups
+        measured_n = sum(len(cs) for _, cs in measured_groups)
+        if measured_n < self.cfg.size * 3:
+            ordered_groups = measured_groups + guess_groups
+
         pool: list[Candidate] = []
         seen_ids = set(exclude)
-        for artist in similar_ranked:
-            for cand in self.popular_tracks_for(artist, n=8):
+        for _artist, cands in ordered_groups:
+            artist_has_measured = any(c.measured for c in cands)
+            for cand in cands:
                 if cand.track_id in seen_ids:
                     continue
+                if is_junk_discovery(cand.name, cand.artists):
+                    continue
                 if cand.popularity < self.cfg.min_popularity:
+                    continue
+                if artist_has_measured and not cand.measured:
                     continue
                 seen_ids.add(cand.track_id)
                 pool.append(cand)
@@ -1032,32 +1344,13 @@ class Mixer:
                 break
 
         print(f"candidate pool after filters: {len(pool)}")
-        # popularity-weighted sample with per-artist cap
-        pool.sort(key=lambda c: c.popularity, reverse=True)
-        picked: list[Candidate] = []
-        per_artist: Counter = Counter()
-
-        def primary(c: Candidate) -> str:
-            return (c.artist_ids[0] if c.artist_ids else (c.artists[0] if c.artists else c.track_id))
-
-        remaining = pool[:]
-        while remaining and len(picked) < self.cfg.size:
-            weights = []
-            eligible = []
-            for c in remaining:
-                a = primary(c)
-                if per_artist[a] >= self.cfg.max_per_artist:
-                    continue
-                eligible.append(c)
-                weights.append(max(1, c.popularity) ** 1.4)
-            if not eligible:
-                break
-            choice = rng.choices(eligible, weights=weights, k=1)[0]
-            picked.append(choice)
-            per_artist[primary(choice)] += 1
-            remaining = [c for c in remaining if c.track_id != choice.track_id]
-
-        picked.sort(key=lambda c: c.popularity, reverse=True)
+        picked = select_mix_tracks(
+            pool,
+            size=self.cfg.size,
+            max_per_artist=self.cfg.max_per_artist,
+            max_path_c=self.cfg.max_path_c,
+            rng=rng,
+        )
         return picked
 
     def persist_mix(self, tracks: list[Candidate], user_id: str, force: bool = False) -> dict:
@@ -1078,6 +1371,8 @@ class Mixer:
                 "size": self.cfg.size,
                 "min_popularity": self.cfg.min_popularity,
                 "max_per_artist": self.cfg.max_per_artist,
+                "min_seed_count": self.cfg.min_seed_count,
+                "max_path_c": self.cfg.max_path_c,
                 "use_likes_as_seeds": self.cfg.use_likes,
                 "never_seed_from": [
                     "recently-played",
@@ -1178,6 +1473,8 @@ def mix_config_from_env(today: date | None = None) -> MixConfig:
         min_popularity=env_int("MIX_MIN_POPULARITY", 55),
         max_per_artist=env_int("MIX_MAX_PER_ARTIST", 2),
         use_likes=env_bool("MIX_USE_LIKES", True),
+        min_seed_count=env_int("MIX_MIN_SEED_COUNT", 2),
+        max_path_c=env_int("MIX_MAX_PATH_C", 10),
         today=today or date.today(),
     )
 
@@ -1786,7 +2083,7 @@ def cmd_self_test() -> int:
     # 5. A search-rank guess never outranks a measured score, and never
     #    empties the pool by falling under the gate.
     cfg55 = MixConfig(min_popularity=55)
-    ramp = [min(cfg55.min_popularity, max(40, 80 - 3 * i)) for i in range(10)]
+    ramp = [path_c_guessed_popularity(i, cfg55.min_popularity) for i in range(10)]
     check(max(ramp) <= cfg55.min_popularity, "Path C never scores above min_popularity")
     check(any(v >= cfg55.min_popularity for v in ramp), "Path C still clears the gate")
     check(
@@ -1823,6 +2120,151 @@ def cmd_self_test() -> int:
         (Mixer.resolve_track(mx, "Blue Monday", "New Order") or {}).get("id") == "H",
         "resolve_track still accepts the right artist",
     )
+
+    # 8. The National Forest is not The National (primary-artist exact match).
+    class _NationalSp:
+        caps = SpotifyCaps()
+
+        def search_tracks(self, q: str, limit: int = 5) -> list[dict]:
+            if "Cascades" in q or "National Forest" in q:
+                return [
+                    {
+                        "id": "NF",
+                        "uri": "spotify:track:NF",
+                        "name": "Queen Of The Cascades",
+                        "artists": [{"id": "nf", "name": "The National Forest"}],
+                    }
+                ]
+            return [
+                {
+                    "id": "TN",
+                    "uri": "spotify:track:TN",
+                    "name": "Bloodbuzz Ohio",
+                    "artists": [{"id": "tn", "name": "The National"}],
+                }
+            ]
+
+    mx = Mixer.__new__(Mixer)
+    mx.sp, mx.cfg = _NationalSp(), MixConfig()
+    check(
+        Mixer.resolve_track(mx, "Queen Of The Cascades", "The National") is None,
+        "resolve_track rejects The National Forest for The National",
+    )
+    check(
+        (Mixer.resolve_track(mx, "Bloodbuzz Ohio", "The National") or {}).get("id") == "TN",
+        "resolve_track still accepts The National as primary",
+    )
+    check(
+        not primary_artist_matches("The National", "The National Forest"),
+        "primary_artist_matches rejects a longer lookalike",
+    )
+    check(
+        primary_artist_matches("Simon & Garfunkel", "Simon and Garfunkel"),
+        "primary_artist_matches folds ampersand",
+    )
+
+    # 9. Sleep / rain mill titles never enter the pool.
+    check(
+        is_junk_discovery("Rain On Roof With Thunder", ["Pure Sleeping Vibes"]),
+        "rain-on-roof + sleeping-vibes is junk",
+    )
+    check(
+        is_junk_discovery("Weightless", ["Marconi Union"]) is False,
+        "a normal title is not junk",
+    )
+    check(
+        is_junk_discovery("Thunder", ["Imagine Dragons"]) is False,
+        "standalone Thunder (real hit) is kept",
+    )
+    check(is_junk_discovery("432 Hz Meditation", ["Spa Yoga"]), "432 Hz / spa / yoga is junk")
+
+    # 10. Path C guesses are capped and sort below measured tracks.
+    rng = random.Random(0)
+    measured_pool = [
+        Candidate(f"M{i}", f"spotify:track:M{i}", f"m{i}", ["A"], [f"a{i}"], 80, "lastfm-top:A", True)
+        for i in range(15)
+    ]
+    guess_pool = [
+        Candidate(f"C{i}", f"spotify:track:C{i}", f"c{i}", ["B"], [f"b{i}"], 55, "spotify-search:B", False)
+        for i in range(40)
+    ]
+    picked = select_mix_tracks(
+        measured_pool + guess_pool,
+        size=40,
+        max_per_artist=2,
+        max_path_c=10,
+        rng=rng,
+    )
+    n_guess = sum(1 for c in picked if not c.measured)
+    check(len(picked) <= 40, "select_mix_tracks respects size")
+    check(n_guess <= 10, "Path C guesses are capped at MIX_MAX_PATH_C")
+    check(any(c.measured for c in picked), "measured tracks are preferred")
+    check(picked[0].measured, "final order puts measured tracks first")
+
+    # A Path-C-only pool can still fill, but never above the cap.
+    only_c = select_mix_tracks(
+        guess_pool,
+        size=40,
+        max_per_artist=2,
+        max_path_c=10,
+        rng=random.Random(1),
+    )
+    check(len(only_c) == 10, "Path-C-only mix is capped at max_path_c")
+    check(all(not c.measured for c in only_c), "Path-C-only pick is all guesses")
+
+    # 11. Seed harvest uses the primary artist only; short names are refused.
+    class _FeatSp:
+        caps = SpotifyCaps()
+
+        def created_playlists(self, uid: str) -> list[dict]:
+            return [{"id": "good", "name": "Deep Cuts"}]
+
+        def playlist_items(self, pid: str) -> list[dict]:
+            return [
+                {
+                    "id": "t1",
+                    "artists": [
+                        {"id": "main", "name": "Main Act"},
+                        {"id": "feat", "name": "Madelyn Grant"},
+                    ],
+                },
+                {
+                    "id": "t2",
+                    "artists": [
+                        {"id": "main", "name": "Main Act"},
+                        {"id": "feat2", "name": "Naomi Wild"},
+                    ],
+                },
+                {
+                    "id": "t3",
+                    "artists": [{"id": "py", "name": "Py"}],
+                },
+            ]
+
+        def liked_tracks(self) -> list[dict]:
+            return []
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        mx = Mixer.__new__(Mixer)
+        mx.sp, mx.paths, mx.cfg = _FeatSp(), p, MixConfig(today=today, use_likes=False)
+        _, _exclude, feat_names = Mixer.collect_library(mx, "u1")
+        check("Main Act" in feat_names, "primary artist is a seed")
+        check("Madelyn Grant" not in feat_names, "featured guest is not a seed")
+        check("Naomi Wild" not in feat_names, "remix-credit name is not a seed")
+        check("Py" not in feat_names, "artist names shorter than 3 are not seeds")
+        check(feat_names["Main Act"] == 2, "primary appearances are counted")
+        qualified = qualify_seed_artists(feat_names, 2)
+        check("Main Act" in qualified, "artist at min seed count is kept")
+        one_off = Counter({"Main Act": 5, "One Hit": 1})
+        check(
+            "One Hit" not in qualify_seed_artists(one_off, 2),
+            "one-off primary is dropped when min_seed_count=2",
+        )
+
+    check(not is_usable_artist_name("Py"), "Py is too short to seed or search")
+    check(not is_usable_artist_name("DJ"), "blocked short credit words are refused")
+    check(is_usable_artist_name("The National"), "a real artist name is usable")
 
     # 7. An unreadable playlist is loud, not silently empty.
     class _ForbiddenSession:
