@@ -4,8 +4,9 @@ A ~40-track **novel + popular** Weekly Mix for a personal Spotify account (Grok 
 `mix.py` never starts OAuth by itself; `oauth.py` is the one-time, opt-in helper that does
 (see [Setup](#what-we-still-need-from-you)). Registering the Spotify app is still on you.
 
-Business-logic decisions (seeds, excludes, Path A/B/C, failure modes) are in
-[docs/ALGORITHM.md](docs/ALGORITHM.md). Read that before changing taste.
+Business-logic decisions (seeds, excludes, Path B/C, failure modes) are in
+[docs/ALGORITHM.md](docs/ALGORITHM.md). Spotify-first: no Last.fm. Read that
+before changing taste.
 
 ```
 .venv/bin/python mix.py self_test     # local filters, no network
@@ -83,30 +84,27 @@ playlists you CREATED  (+ optional Liked Songs as artist seeds)
                 │
                 ▼
      similar artists, in order:
-       1. Last.fm artist.getSimilar          (if LASTFM_API_KEY)
-       2. MusicBrainz name → MBID
+       1. MusicBrainz name → MBID
           + ListenBrainz labs similar-artists (no key)
-       3. Spotify related-artists             (only if probe says it still works)
+       2. Spotify related-artists             (only if probe says it still works)
                 │
                 ▼
      those artists' popular tracks:
-       1. Last.fm artist.getTopTracks → Spotify search resolve
-          popularity proxy: 15 * log10(listeners+1)  (~3k listeners ≈ 55)
-       2. Spotify /artists/{id}/top-tracks            (extended quota only)
-       3. Spotify search artist:"Name" type=track     (rank ≈ popularity;
-          Last.fm track.getInfo when a key is set; else a capped guess)
+       1. Spotify /artists/{id}/top-tracks            (extended quota only)
+       2. Spotify search artist:"Name" type=track     (Dev Mode happy path;
+          search rank is a soft score, not a flat 55)
                 │
                 ▼
      drop if in created playlists, likes, or state/played.json
      drop sleep/ambient/rain-mill titles; primary Spotify artist must match
-     keep popularity >= 55 (Spotify pop if present, else Last.fm proxy)
+     keep measured Spotify pop >= 55; Path C guesses stay below that and stay distinct
      cap 2 tracks / artist, ~40 tracks, week-stable RNG
-     at most MIX_MAX_PATH_C search-rank guesses (default 10)
 ```
 
 ## Quality
 
-Filters added after a live mix came back as 40 Path C tracks, all popularity 55:
+Filters added after a live mix came back as 40 Path C tracks, all popularity 55.
+Discovery is Spotify + ListenBrainz. Last.fm is not used.
 
 - **Primary-artist resolve.** `The National Forest` is not `The National`. Featured
   guests are ignored when matching.
@@ -117,8 +115,9 @@ Filters added after a live mix came back as 40 Path C tracks, all popularity 55:
   `MIX_MIN_SEED_COUNT` (default 2) drops one-off primaries.
 - **Short names refused.** Length `< 3` (e.g. `Py`) and blocked words are not
   seeded or searched.
-- **Path C cannot flood.** Measured Last.fm/Spotify scores are preferred.
-  Guesses sort below them and are capped at `MIX_MAX_PATH_C`.
+- **Path C ranking.** Search hits get distinct scores from their rank (never
+  a flat 55). Real Spotify popularity, when present, sorts above guesses.
+  `MIX_MAX_PATH_C` caps guesses only when measured tracks are also in the pool.
 
 **Never seeded from:** `GET /me/top`, recently-played, baby/house listening,
 out-of-season holiday playlists, Spotify's own editorial lists.
@@ -148,14 +147,13 @@ Copy `.env.example` to `.env` (gitignored).
 | `SPOTIFY_CLIENT_SECRET` | yes | Dashboard secret |
 | `SPOTIFY_REFRESH_TOKEN` | yes | Headless token; script refreshes access |
 | `SPOTIFY_ACCESS_TOKEN` | no | Skip refresh if still valid |
-| `LASTFM_API_KEY` | recommended | Similar + top-tracks; free at last.fm/api |
 | `MIX_PLAYLIST_NAME` | no | default `Weekly Mix` |
 | `MIX_SIZE` | no | default `40` |
 | `MIX_MIN_POPULARITY` | no | default `55` |
 | `MIX_MAX_PER_ARTIST` | no | default `2` |
 | `MIX_USE_LIKES` | no | default `1`. Likes are ALWAYS excluded from output; this only controls whether their artists also seed. |
 | `MIX_MIN_SEED_COUNT` | no | default `2`. Primary artist must appear this many times before seeding. |
-| `MIX_MAX_PATH_C` | no | default `10`. Max Path C search-rank guesses in the final mix. |
+| `MIX_MAX_PATH_C` | no | default `10`. Max Path C guesses when measured Spotify-pop tracks exist. Ignored for a guess-only mix. |
 
 ## Local state (`state/`)
 
@@ -164,7 +162,7 @@ Copy `.env.example` to `.env` (gitignored).
 | `config.json` | `publish` | mix playlist id + uri |
 | `last_mix.json` | `build_mix` | the 40 tracks + week stamp |
 | `played.json` | `log_plays` | track ids played *from our playlist URI* |
-| `similar_cache.json` | `build_mix` | Last.fm/LB similar-artist cache (14d) |
+| `similar_cache.json` | `build_mix` | ListenBrainz similar-artist cache (14d) |
 | `nowplaying.jsonl` | `scripts/nowplaying_*.py` | web-player now-playing log, read by `ingest_ui` |
 | `watch_plays.pid` | `watch_plays` | pid of the running watcher |
 
@@ -198,9 +196,10 @@ JSON under `state/` is gitignored except `.gitkeep`.
    ```
 
    Put `refresh_token` in `.env` as `SPOTIFY_REFRESH_TOKEN`.
-3. **Last.fm API key** (optional but much better discovery): https://www.last.fm/api/account/create
-4. After first `publish`, run `log_plays` often (recently-played is a short window)
+3. After first `publish`, run `log_plays` often (recently-played is a short window)
    so heard mix tracks stay out of next week's pool.
+
+Similar artists use MusicBrainz + ListenBrainz (no key). Last.fm is not used.
 
 ## Layout
 

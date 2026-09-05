@@ -11,16 +11,18 @@ Never used as seeds:
   - out-of-season holiday playlists
   - the Weekly Mix playlist itself
 
-Discovery (Spotify /recommendations and /related-artists are 403 for new apps
-since 2024-11-27; Dev Mode also lost /artists/{id}/top-tracks and the
-popularity field in Feb 2026):
+Discovery is Spotify-first. /recommendations and /related-artists are 403 for
+new apps since 2024-11-27; Dev Mode also lost /artists/{id}/top-tracks and the
+popularity field in Feb 2026. Similar artists come from MusicBrainz+ListenBrainz
+(no key). Popular tracks come from Spotify search (and top-tracks if this app
+still has it). Last.fm is not used.
 
   created-playlist artists
-    → Last.fm artist.getSimilar  (or ListenBrainz similar-artists)
-    → those artists' popular tracks (Last.fm top-tracks, or Spotify search)
+    → MusicBrainz + ListenBrainz similar-artists
+    → those artists' Spotify search hits (top-tracks if available)
     → drop anything already in created playlists, likes, or the play log
     → drop sleep/ambient/rain-mill titles and unusable seed names
-    → keep ~40, biased to popular, max N per artist, cap Path C guesses
+    → keep ~40, search-rank differentiated, max N per artist
 
 Commands: build_mix | publish | log_plays | watch_plays | ingest_ui |
           maybe_refresh | probe | print_auth_url | self_test
@@ -52,7 +54,6 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_STATE = ROOT / "state"
 SPOTIFY_API = "https://api.spotify.com/v1"
 SPOTIFY_ACCOUNTS = "https://accounts.spotify.com/api/token"
-LASTFM_API = "https://ws.audioscrobbler.com/2.0/"
 MB_API = "https://musicbrainz.org/ws/2"
 LB_SIMILAR = "https://labs.api.listenbrainz.org/similar-artists/json"
 LB_SIMILAR_ALGO = "session_based_days_9000_session_300_contribution_5_threshold_15_limit_50_skip_30"
@@ -281,15 +282,16 @@ def primary_artist_matches(want: str, primary: str) -> bool:
 
 
 def path_c_guessed_popularity(rank: int, min_popularity: int) -> int:
-    """Search-rank guess on Spotify's 0–100 scale.
+    """Search-rank soft score. Rank 0 is strongest.
 
-    Rank 0 is strongest. Never above min_popularity, so a guess cannot
-    outrank a measured Last.fm/Spotify score at the same number. Top ranks
-    still equal the gate so a Last.fm-less run still has a pool. The mix
-    must not treat these as interchangeable with Path A: sort them below
-    measured scores and cap how many make the final 40.
+    Strictly decreasing by rank so hits are not interchangeable. The old
+    formula clamped every usable rank to min_popularity (55), so a Path C
+    mix was 40 identical scores. Always below min_popularity so a real
+    Spotify popularity field, when present, outranks every guess. Path C
+    guesses do not use min_popularity as an admission gate: search rank,
+    junk filters, and primary-artist match decide eligibility.
     """
-    return min(min_popularity, max(40, 80 - 3 * rank))
+    return max(1, min_popularity - 1 - 2 * rank)
 
 
 def qualify_seed_artists(counts: Counter, min_count: int) -> Counter:
@@ -729,90 +731,8 @@ def authorize_url(client_id: str, redirect_uri: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Last.fm / MusicBrainz / ListenBrainz  (related-artists replacement)
+# MusicBrainz / ListenBrainz  (related-artists replacement; no API key)
 # ---------------------------------------------------------------------------
-
-class LastFm:
-    def __init__(self, api_key: str) -> None:
-        self.key = api_key
-        self.http = Http(min_interval=0.22)
-
-    def _call(self, method: str, **params: Any) -> dict:
-        q = {"method": method, "api_key": self.key, "format": "json", **params}
-        resp = self.http.request("GET", LASTFM_API, params=q)
-        if resp.status_code >= 400:
-            return {}
-        data = resp.json()
-        if isinstance(data, dict) and data.get("error"):
-            return {}
-        return data if isinstance(data, dict) else {}
-
-    def similar_artists(self, artist: str, limit: int = 12) -> list[tuple[str, float]]:
-        data = self._call("artist.getSimilar", artist=artist, limit=str(limit), autocorrect="1")
-        rows = ((data.get("similarartists") or {}).get("artist")) or []
-        if isinstance(rows, dict):
-            rows = [rows]
-        out: list[tuple[str, float]] = []
-        for row in rows:
-            name = (row.get("name") or "").strip()
-            if not name:
-                continue
-            try:
-                match = float(row.get("match") or 0)
-            except (TypeError, ValueError):
-                match = 0.0
-            out.append((name, match))
-        return out
-
-    def top_tracks(self, artist: str, limit: int = 10) -> list[dict]:
-        data = self._call("artist.getTopTracks", artist=artist, limit=str(limit), autocorrect="1")
-        rows = ((data.get("toptracks") or {}).get("track")) or []
-        if isinstance(rows, dict):
-            rows = [rows]
-        out = []
-        for row in rows:
-            name = (row.get("name") or "").strip()
-            if not name:
-                continue
-            try:
-                listeners = int(row.get("listeners") or 0)
-            except (TypeError, ValueError):
-                listeners = 0
-            try:
-                playcount = int(row.get("playcount") or 0)
-            except (TypeError, ValueError):
-                playcount = 0
-            out.append(
-                {
-                    "name": name,
-                    "artist": ((row.get("artist") or {}).get("name")) or artist,
-                    "listeners": listeners,
-                    "playcount": playcount,
-                }
-            )
-        return out
-
-    def track_info(self, track: str, artist: str) -> dict | None:
-        """Last.fm track.getInfo listener count, or None if missing."""
-        data = self._call(
-            "track.getInfo",
-            track=track,
-            artist=artist,
-            autocorrect="1",
-        )
-        row = data.get("track") if isinstance(data, dict) else None
-        if not isinstance(row, dict):
-            return None
-        name = (row.get("name") or "").strip()
-        if not name:
-            return None
-        try:
-            listeners = int(row.get("listeners") or 0)
-        except (TypeError, ValueError):
-            listeners = 0
-        credited = ((row.get("artist") or {}).get("name")) or artist
-        return {"name": name, "artist": credited, "listeners": listeners}
-
 
 class MusicBrainz:
     def __init__(self) -> None:
@@ -872,17 +792,6 @@ class ListenBrainz:
         out.sort(key=lambda x: x[1], reverse=True)
         return out[:limit]
 
-def lastfm_listeners_to_popularity(listeners: int) -> int:
-    """Map Last.fm listener counts onto roughly Spotify's 0–100 popularity scale.
-
-    15 * log10(n+1):  ~3.2k listeners ≈ 55, 100k ≈ 75, 1M ≈ 90.
-    """
-    import math
-
-    if listeners <= 0:
-        return 0
-    return int(min(100, round(15.0 * math.log10(listeners + 1))))
-
 
 # ---------------------------------------------------------------------------
 # Mix builder
@@ -897,7 +806,7 @@ class Candidate:
     artist_ids: list[str]
     popularity: int
     source: str
-    # False = Path C search-rank guess with no Last.fm/Spotify measurement.
+    # False = Path C search-rank guess (no Spotify popularity field).
     measured: bool = True
 
 
@@ -963,11 +872,12 @@ def select_mix_tracks(
     max_path_c: int,
     rng: random.Random,
 ) -> list[Candidate]:
-    """Pick the final mix. Measured Path A/B first; Path C guesses capped.
+    """Pick the final mix. Real Spotify popularity first; Path C ranked next.
 
-    Path C search-rank guesses all tend to land on the same popularity (the
-    gate). Without a separate tier they flood a 40-track mix. Measured tracks
-    are always preferred; guessed tracks fill remaining slots up to max_path_c.
+    When any measured tracks exist, Path C guesses fill remaining slots up to
+    max_path_c. When the pool is Path C only (Dev Mode, no popularity field),
+    that is the happy path: fill to size. Search-rank scores stay distinct and
+    below the popularity gate so they never all tie at 55.
     """
     measured = [c for c in pool if c.measured]
     guessed = [c for c in pool if not c.measured]
@@ -977,7 +887,8 @@ def select_mix_tracks(
     per_artist: Counter = Counter()
     picked = _weighted_pick(measured, size, rng, per_artist, max_per_artist)
     if len(picked) < size and guessed:
-        need = min(max_path_c, size - len(picked))
+        leftover = size - len(picked)
+        need = leftover if not picked else min(max_path_c, leftover)
         picked.extend(_weighted_pick(guessed, need, rng, per_artist, max_per_artist))
 
     picked.sort(key=lambda c: (0 if c.measured else 1, -c.popularity))
@@ -985,11 +896,10 @@ def select_mix_tracks(
 
 
 class Mixer:
-    def __init__(self, sp: Spotify, paths: Paths, cfg: MixConfig, lastfm: LastFm | None) -> None:
+    def __init__(self, sp: Spotify, paths: Paths, cfg: MixConfig) -> None:
         self.sp = sp
         self.paths = paths
         self.cfg = cfg
-        self.lastfm = lastfm
         self.mb = MusicBrainz()
         self.lb = ListenBrainz()
         self._similar_cache: dict[str, Any] = read_json(paths.similar_cache, {})
@@ -1086,12 +996,9 @@ class Mixer:
                 return list(cached["names"])[:limit]
 
         names: list[str] = []
-        if self.lastfm:
-            names = [n for n, _ in self.lastfm.similar_artists(artist_name, limit=limit)]
-        if not names:
-            mbid = self.mb.artist_mbid(artist_name)
-            if mbid:
-                names = [n for n, _ in self.lb.similar_artists(mbid, limit=limit)]
+        mbid = self.mb.artist_mbid(artist_name)
+        if mbid:
+            names = [n for n, _ in self.lb.similar_artists(mbid, limit=limit)]
         # Spotify related-artists only if this app still has it (extended quota).
         if not names and self.sp.caps.related_artists is not False:
             sp_artist = self.sp.search_artist(artist_name)
@@ -1169,32 +1076,8 @@ class Mixer:
             return []
         found: list[Candidate] = []
 
-        # Path A: Last.fm ranking (best popularity proxy when Spotify
-        # popularity is stripped in Dev Mode).
-        if self.lastfm:
-            for row in self.lastfm.top_tracks(artist_name, limit=n):
-                if is_junk_discovery(row["name"], [row["artist"], artist_name]):
-                    continue
-                pop = lastfm_listeners_to_popularity(row["listeners"])
-                hit = self.resolve_track(row["name"], row["artist"])
-                if not hit:
-                    continue
-                sp_pop = hit.get("popularity")
-                if isinstance(sp_pop, int):
-                    self.sp.caps.popularity_field = True
-                    pop = sp_pop
-                cand = self._candidate_from_hit(
-                    hit,
-                    artist_name=artist_name,
-                    popularity=pop,
-                    source=f"lastfm-top:{artist_name}",
-                    measured=True,
-                )
-                if cand:
-                    found.append(cand)
-
         # Path B: Spotify artist top-tracks (extended quota / grandfathered).
-        if len(found) < n and self.sp.caps.artist_top_tracks is not False:
+        if self.sp.caps.artist_top_tracks is not False:
             sp_artist = self.sp.search_artist(artist_name)
             if sp_artist and sp_artist.get("id"):
                 for hit in self.sp.artist_top_tracks(sp_artist["id"]):
@@ -1211,9 +1094,9 @@ class Mixer:
                     if cand:
                         found.append(cand)
 
-        # Path C: Spotify search ranking ≈ popularity (Dev Mode fallback).
-        # Only when A/B produced almost nothing. Search-rank guesses all used
-        # to land on exactly min_popularity (55) and flood the final 40.
+        # Path C: Spotify search. This is the Dev Mode happy path. Search
+        # order is a soft rank: earlier hits score higher, never all equal
+        # at the popularity gate.
         if len(found) < 3:
             hits = self.sp.search_tracks(f'artist:"{artist_name}"', limit=10)
             for i, hit in enumerate(hits):
@@ -1230,23 +1113,6 @@ class Mixer:
                         artist_name=artist_name,
                         popularity=pop,
                         source=f"spotify-search:{artist_name}",
-                        measured=True,
-                    )
-                    if cand:
-                        found.append(cand)
-                    continue
-                # No Spotify popularity field (Dev Mode). Prefer a Last.fm
-                # listener count over a search-rank guess.
-                if self.lastfm:
-                    info = self.lastfm.track_info(hit.get("name") or "", credited[0])
-                    listeners = (info or {}).get("listeners") or 0
-                    if listeners <= 0:
-                        continue
-                    cand = self._candidate_from_hit(
-                        hit,
-                        artist_name=artist_name,
-                        popularity=lastfm_listeners_to_popularity(listeners),
-                        source=f"lastfm-info:{artist_name}",
                         measured=True,
                     )
                     if cand:
@@ -1318,8 +1184,9 @@ class Mixer:
 
         measured_groups = [(a, cs) for a, cs in by_artist if any(c.measured for c in cs)]
         guess_groups = [(a, cs) for a, cs in by_artist if not any(c.measured for c in cs)]
-        # Prefer artists that produced Path A/B (or Last.fm-verified) tracks.
-        # Path-C-only artists are consulted only if the measured pool is thin.
+        # Prefer artists that produced real Spotify popularity (Path B, or
+        # Path C with the popularity field). Path-C-only artists are the
+        # Dev Mode happy path and are always consulted if measured is thin.
         ordered_groups = measured_groups
         measured_n = sum(len(cs) for _, cs in measured_groups)
         if measured_n < self.cfg.size * 3:
@@ -1334,7 +1201,7 @@ class Mixer:
                     continue
                 if is_junk_discovery(cand.name, cand.artists):
                     continue
-                if cand.popularity < self.cfg.min_popularity:
+                if cand.measured and cand.popularity < self.cfg.min_popularity:
                     continue
                 if artist_has_measured and not cand.measured:
                     continue
@@ -1482,14 +1349,7 @@ def mix_config_from_env(today: date | None = None) -> MixConfig:
 def cmd_build_mix(paths: Paths, persist: bool = True, force: bool = False) -> list[Candidate]:
     sp = load_client()
     cfg = mix_config_from_env()
-    lastfm_key = env("LASTFM_API_KEY")
-    lastfm = LastFm(lastfm_key) if lastfm_key else None
-    if not lastfm:
-        print(
-            "note: LASTFM_API_KEY unset — similar artists via MusicBrainz+ListenBrainz; "
-            "top tracks via Spotify search (weaker popularity signal)."
-        )
-    mixer = Mixer(sp, paths, cfg, lastfm)
+    mixer = Mixer(sp, paths, cfg)
     user = sp.me()
     tracks = mixer.build(user)
     if persist:
@@ -1974,8 +1834,9 @@ def cmd_self_test() -> int:
     check(skip_seed_reason("House Listening", today, "Weekly Mix") is not None, "house listening skipped")
     check(skip_seed_reason("Weekly Mix", today, "Weekly Mix") is not None, "output playlist skipped")
     check(skip_seed_reason("Deep Cuts", today, "Weekly Mix") is None, "normal playlist kept")
-    check(lastfm_listeners_to_popularity(3200) >= 50, "Last.fm ~3k listeners maps near 55")
-    check(lastfm_listeners_to_popularity(1_000_000) >= 85, "Last.fm 1M listeners maps high")
+    ramp0 = [path_c_guessed_popularity(i, 55) for i in range(5)]
+    check(all(ramp0[i] > ramp0[i + 1] for i in range(4)), "Path C search ranks are strictly decreasing")
+    check(len(set(ramp0)) == len(ramp0), "Path C ranks never share a score")
 
     # ---------------------------------------------------------------- regressions
     # One per defect found in the 2026-09-02 review. Each of these failed
@@ -2080,16 +1941,13 @@ def cmd_self_test() -> int:
         check("mine-t" not in exclude, "our own output playlist is skipped entirely")
         check("liked-t" in exclude, "likes contribute excludes")
 
-    # 5. A search-rank guess never outranks a measured score, and never
-    #    empties the pool by falling under the gate.
+    # 5. A search-rank guess never outranks a real Spotify popularity score.
+    #    Ranks stay distinct and below the gate (the old clamp-to-55 is gone).
     cfg55 = MixConfig(min_popularity=55)
     ramp = [path_c_guessed_popularity(i, cfg55.min_popularity) for i in range(10)]
-    check(max(ramp) <= cfg55.min_popularity, "Path C never scores above min_popularity")
-    check(any(v >= cfg55.min_popularity for v in ramp), "Path C still clears the gate")
-    check(
-        lastfm_listeners_to_popularity(100_000) > max(ramp),
-        "a measured 100k-listener track outranks any search guess",
-    )
+    check(max(ramp) < cfg55.min_popularity, "Path C guesses stay below min_popularity")
+    check(ramp[0] > ramp[1] > ramp[2], "top Path C ranks are not a flat tie")
+    check(55 > max(ramp), "a Spotify-pop-55 track outranks any search guess")
 
     # 6. A cover by another artist is dropped, not substituted.
     class _SearchSp:
@@ -2181,11 +2039,20 @@ def cmd_self_test() -> int:
     # 10. Path C guesses are capped and sort below measured tracks.
     rng = random.Random(0)
     measured_pool = [
-        Candidate(f"M{i}", f"spotify:track:M{i}", f"m{i}", ["A"], [f"a{i}"], 80, "lastfm-top:A", True)
+        Candidate(f"M{i}", f"spotify:track:M{i}", f"m{i}", ["A"], [f"a{i}"], 80, "spotify-top:A", True)
         for i in range(15)
     ]
     guess_pool = [
-        Candidate(f"C{i}", f"spotify:track:C{i}", f"c{i}", ["B"], [f"b{i}"], 55, "spotify-search:B", False)
+        Candidate(
+            f"C{i}",
+            f"spotify:track:C{i}",
+            f"c{i}",
+            ["B"],
+            [f"b{i}"],
+            path_c_guessed_popularity(i % 3, 55),
+            "spotify-search:B",
+            False,
+        )
         for i in range(40)
     ]
     picked = select_mix_tracks(
@@ -2201,7 +2068,7 @@ def cmd_self_test() -> int:
     check(any(c.measured for c in picked), "measured tracks are preferred")
     check(picked[0].measured, "final order puts measured tracks first")
 
-    # A Path-C-only pool can still fill, but never above the cap.
+    # Path C is the Dev Mode happy path: a guess-only pool fills to size.
     only_c = select_mix_tracks(
         guess_pool,
         size=40,
@@ -2209,8 +2076,9 @@ def cmd_self_test() -> int:
         max_path_c=10,
         rng=random.Random(1),
     )
-    check(len(only_c) == 10, "Path-C-only mix is capped at max_path_c")
+    check(len(only_c) == 40, "Path-C-only mix fills to size")
     check(all(not c.measured for c in only_c), "Path-C-only pick is all guesses")
+    check(len({c.popularity for c in only_c}) > 1, "Path-C-only mix is not a flat score")
 
     # 11. Seed harvest uses the primary artist only; short names are refused.
     class _FeatSp:
