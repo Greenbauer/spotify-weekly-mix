@@ -12,6 +12,7 @@ A ~40-track **novel + popular** Weekly Mix for a personal Spotify account (Grok 
 .venv/bin/python mix.py log_plays     # record plays of OUR playlist only
 .venv/bin/python mix.py probe         # which Spotify endpoints still work
 .venv/bin/python mix.py ingest_ui     # mark mix tracks from a now-playing JSONL
+.venv/bin/python mix.py roll_playlist # drop delayed hears; append discoveries (~40)
 .venv/bin/python mix.py maybe_refresh # if the current mix is used up, publish a new one
 .venv/bin/python mix.py watch_plays   # adaptive now-playing poll so short skips count
 ```
@@ -132,13 +133,14 @@ Copy `.env.example` to `.env` (gitignored).
 | `MIX_MIN_POPULARITY` | no | default `55` |
 | `MIX_MAX_PER_ARTIST` | no | default `2` |
 | `MIX_USE_LIKES` | no | default `1`. Likes are ALWAYS excluded from output; this only controls whether their artists also seed. |
+| `MIX_ROLL_DELAY_MIN` | no | default `5`. Minutes a heard mix track stays on the playlist before `roll_playlist` removes it. |
 
 ## Local state (`state/`)
 
 | File | Written by | Contents |
 |---|---|---|
-| `config.json` | `publish` | mix playlist id + uri |
-| `last_mix.json` | `build_mix` | the 40 tracks + week stamp |
+| `config.json` | `publish`, `roll_playlist` | mix playlist id + uri + track_count |
+| `last_mix.json` | `build_mix`, `roll_playlist` | the current playlist tracks + week stamp |
 | `played.json` | `log_plays` | track ids played *from our playlist URI* |
 | `similar_cache.json` | `build_mix` | Last.fm/LB similar-artist cache (14d) |
 | `nowplaying.jsonl` | `scripts/nowplaying_*.py` | web-player now-playing log, read by `ingest_ui` |
@@ -175,8 +177,29 @@ JSON under `state/` is gitignored except `.gitkeep`.
 
    Put `refresh_token` in `.env` as `SPOTIFY_REFRESH_TOKEN`.
 3. **Last.fm API key** (optional but much better discovery): https://www.last.fm/api/account/create
-4. After first `publish`, run `log_plays` often (recently-played is a short window)
-   so heard mix tracks stay out of next week's pool.
+4. After first `publish`, run the hourly play-log / skip-watcher so heard mix
+   tracks drop off and stay out of the next pool:
+
+   `ingest_ui` → `log_plays --recent-only` → `roll_playlist` → `maybe_refresh`
+
+   `maybe_refresh` is the full rebuild when the mix is empty or aged. Monday
+   `publish` still overwrites the whole playlist for a fresh week.
+
+## Rolling playlist
+
+When detection marks a mix track as heard, `roll_playlist` waits
+`MIX_ROLL_DELAY_MIN` minutes (default 5), then removes it. Remaining songs stay
+at the top in the same relative order. New discovery tracks (same Mixer
+pipeline as `build_mix`) append at the bottom so the playlist stays about
+`MIX_SIZE` (40).
+
+A track heard less recently than the delay stays put. If nothing is eligible
+to remove and the playlist is already about `MIX_SIZE`, the command prints
+`ROLL noop` and exits 0. Otherwise it prints
+`ROLL removed=N kept=K added=A size=S` and writes the playlist with one
+`replace_playlist_tracks` (`/playlists/{id}/items`, fallback `/tracks`).
+
+`roll_playlist` does not ping anyone and does not poll currently-playing.
 
 ## Layout
 
