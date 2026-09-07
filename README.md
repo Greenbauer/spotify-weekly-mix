@@ -4,6 +4,10 @@ A ~40-track **novel + popular** Weekly Mix for a personal Spotify account (Grok 
 `mix.py` never starts OAuth by itself; `oauth.py` is the one-time, opt-in helper that does
 (see [Setup](#what-we-still-need-from-you)). Registering the Spotify app is still on you.
 
+Business-logic decisions (seeds, excludes, Path B/C, failure modes) are in
+[docs/ALGORITHM.md](docs/ALGORITHM.md). Spotify-first: no Last.fm. Read that
+before changing taste.
+
 ```
 .venv/bin/python mix.py self_test     # local filters, no network
 .venv/bin/python mix.py build_mix     # compute 40 tracks (needs tokens)
@@ -81,23 +85,40 @@ playlists you CREATED  (+ optional Liked Songs as artist seeds)
                 │
                 ▼
      similar artists, in order:
-       1. Last.fm artist.getSimilar          (if LASTFM_API_KEY)
-       2. MusicBrainz name → MBID
+       1. MusicBrainz name → MBID
           + ListenBrainz labs similar-artists (no key)
-       3. Spotify related-artists             (only if probe says it still works)
+       2. Spotify related-artists             (only if probe says it still works)
                 │
                 ▼
      those artists' popular tracks:
-       1. Last.fm artist.getTopTracks → Spotify search resolve
-          popularity proxy: 15 * log10(listeners+1)  (~3k listeners ≈ 55)
-       2. Spotify /artists/{id}/top-tracks            (extended quota only)
-       3. Spotify search artist:"Name" type=track     (rank ≈ popularity)
+       1. Spotify /artists/{id}/top-tracks            (extended quota only)
+       2. Spotify search artist:"Name" type=track     (Dev Mode happy path;
+          search rank is a soft score, not a flat 55)
                 │
                 ▼
      drop if in created playlists, likes, or state/played.json
-     keep popularity >= 55 (Spotify pop if present, else Last.fm proxy)
+     drop sleep/ambient/rain-mill titles; primary Spotify artist must match
+     keep measured Spotify pop >= 55; Path C guesses stay below that and stay distinct
      cap 2 tracks / artist, ~40 tracks, week-stable RNG
 ```
+
+## Quality
+
+Filters added after a live mix came back as 40 Path C tracks, all popularity 55.
+Discovery is Spotify + ListenBrainz. Last.fm is not used.
+
+- **Primary-artist resolve.** `The National Forest` is not `The National`. Featured
+  guests are ignored when matching.
+- **Junk titles/artists.** Sleep, ambient mills, white noise, rain-on-roof,
+  thunder-sounds, spa/massage/yoga/meditation, 432 Hz, lofi study. Standalone
+  hit titles like `Thunder` stay.
+- **Primary-only seeds.** Remix-credit names do not expand similar-artists.
+  `MIX_MIN_SEED_COUNT` (default 2) drops one-off primaries.
+- **Short names refused.** Length `< 3` (e.g. `Py`) and blocked words are not
+  seeded or searched.
+- **Path C ranking.** Search hits get distinct scores from their rank (never
+  a flat 55). Real Spotify popularity, when present, sorts above guesses.
+  `MIX_MAX_PATH_C` caps guesses only when measured tracks are also in the pool.
 
 **Never seeded from:** `GET /me/top`, recently-played, baby/house listening,
 out-of-season holiday playlists, Spotify's own editorial lists.
@@ -127,12 +148,13 @@ Copy `.env.example` to `.env` (gitignored).
 | `SPOTIFY_CLIENT_SECRET` | yes | Dashboard secret |
 | `SPOTIFY_REFRESH_TOKEN` | yes | Headless token; script refreshes access |
 | `SPOTIFY_ACCESS_TOKEN` | no | Skip refresh if still valid |
-| `LASTFM_API_KEY` | recommended | Similar + top-tracks; free at last.fm/api |
 | `MIX_PLAYLIST_NAME` | no | default `Weekly Mix` |
 | `MIX_SIZE` | no | default `40` |
 | `MIX_MIN_POPULARITY` | no | default `55` |
 | `MIX_MAX_PER_ARTIST` | no | default `2` |
 | `MIX_USE_LIKES` | no | default `1`. Likes are ALWAYS excluded from output; this only controls whether their artists also seed. |
+| `MIX_MIN_SEED_COUNT` | no | default `2`. Primary artist must appear this many times before seeding. |
+| `MIX_MAX_PATH_C` | no | default `10`. Max Path C guesses when measured Spotify-pop tracks exist. Ignored for a guess-only mix. |
 | `MIX_ROLL_DELAY_MIN` | no | default `5`. Minutes a heard mix track stays on the playlist before `roll_playlist` removes it. |
 
 ## Local state (`state/`)
@@ -142,7 +164,7 @@ Copy `.env.example` to `.env` (gitignored).
 | `config.json` | `publish`, `roll_playlist` | mix playlist id + uri + track_count |
 | `last_mix.json` | `build_mix`, `roll_playlist` | the current playlist tracks + week stamp |
 | `played.json` | `log_plays` | track ids played *from our playlist URI* |
-| `similar_cache.json` | `build_mix` | Last.fm/LB similar-artist cache (14d) |
+| `similar_cache.json` | `build_mix` | ListenBrainz similar-artist cache (14d) |
 | `nowplaying.jsonl` | `scripts/nowplaying_*.py` | web-player now-playing log, read by `ingest_ui` |
 | `watch_plays.pid` | `watch_plays` | pid of the running watcher |
 
@@ -176,8 +198,7 @@ JSON under `state/` is gitignored except `.gitkeep`.
    ```
 
    Put `refresh_token` in `.env` as `SPOTIFY_REFRESH_TOKEN`.
-3. **Last.fm API key** (optional but much better discovery): https://www.last.fm/api/account/create
-4. After first `publish`, run the hourly play-log / skip-watcher so heard mix
+3. After first `publish`, run the hourly play-log / skip-watcher so heard mix
    tracks drop off and stay out of the next pool:
 
    `ingest_ui` → `log_plays --recent-only` → `roll_playlist` → `maybe_refresh`
@@ -185,13 +206,15 @@ JSON under `state/` is gitignored except `.gitkeep`.
    `maybe_refresh` is the full rebuild when the mix is empty or aged. Monday
    `publish` still overwrites the whole playlist for a fresh week.
 
+Similar artists use MusicBrainz + ListenBrainz (no key). Last.fm is not used.
+
 ## Rolling playlist
 
 When detection marks a mix track as heard, `roll_playlist` waits
 `MIX_ROLL_DELAY_MIN` minutes (default 5), then removes it. Remaining songs stay
 at the top in the same relative order. New discovery tracks (same Mixer
-pipeline as `build_mix`) append at the bottom so the playlist stays about
-`MIX_SIZE` (40).
+pipeline as `build_mix`, including Path C / junk / primary-only seeds) append
+at the bottom so the playlist stays about `MIX_SIZE` (40).
 
 A track heard less recently than the delay stays put. If nothing is eligible
 to remove and the playlist is already about `MIX_SIZE`, the command prints
@@ -206,6 +229,7 @@ to remove and the playlist is already about `MIX_SIZE`, the command prints
 ```
 mix.py            the mixer CLI
 oauth.py          one-time OAuth helper (writes .env, mode 600)
+docs/ALGORITHM.md business logic (seeds, excludes, Path B/C, rolling)
 requirements.txt .env.example
 scripts/          optional web-player skip helpers
 state/            local only (gitignored JSON)
