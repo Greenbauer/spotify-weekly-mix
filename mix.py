@@ -25,7 +25,7 @@ still has it). Last.fm is not used.
     → keep ~40, search-rank differentiated, max N per artist
 
 Commands: build_mix | publish | log_plays | watch_plays | ingest_ui |
-          maybe_refresh | probe | print_auth_url | self_test
+          roll_playlist | maybe_refresh | probe | print_auth_url | self_test
 
 Business logic: docs/ALGORITHM.md. This script does not register a Spotify
 app and does not start OAuth; oauth.py is the separate, opt-in helper that does.
@@ -34,6 +34,8 @@ app and does not start OAuth; oauth.py is the separate, opt-in helper that does.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import random
@@ -1138,9 +1140,16 @@ class Mixer:
             uniq.append(c)
         return uniq
 
-    def build(self, user: dict) -> list[Candidate]:
+    def build(
+        self,
+        user: dict,
+        extra_exclude: set[str] | None = None,
+        target_size: int | None = None,
+    ) -> list[Candidate]:
         user_id = user["id"]
         _, exclude, raw_seeds = self.collect_library(user_id)
+        if extra_exclude:
+            exclude = set(exclude) | set(extra_exclude)
         seed_names = qualify_seed_artists(raw_seeds, self.cfg.min_seed_count)
         if seed_names is not raw_seeds:
             print(
@@ -1149,6 +1158,10 @@ class Mixer:
             )
         if not seed_names:
             raise RuntimeError("no seed artists — create some playlists first")
+
+        size = self.cfg.size if target_size is None else max(0, int(target_size))
+        if size <= 0:
+            return []
 
         top_seeds = [name for name, _ in seed_names.most_common(40)]
         print(f"seed artists: {len(top_seeds)} (from {len(seed_names)} unique)")
@@ -1179,7 +1192,7 @@ class Mixer:
                 continue
             by_artist.append((artist, self.popular_tracks_for(artist, n=8)))
             n_cands = sum(len(cs) for _, cs in by_artist)
-            if n_cands >= self.cfg.size * 8:
+            if n_cands >= max(size, self.cfg.size) * 8:
                 break
 
         measured_groups = [(a, cs) for a, cs in by_artist if any(c.measured for c in cs)]
@@ -1207,13 +1220,13 @@ class Mixer:
                     continue
                 seen_ids.add(cand.track_id)
                 pool.append(cand)
-            if len(pool) >= self.cfg.size * 6:
+            if len(pool) >= max(size, self.cfg.size) * 6:
                 break
 
         print(f"candidate pool after filters: {len(pool)}")
         picked = select_mix_tracks(
             pool,
-            size=self.cfg.size,
+            size=size,
             max_per_artist=self.cfg.max_per_artist,
             max_path_c=self.cfg.max_path_c,
             rng=rng,
@@ -1516,6 +1529,90 @@ def cmd_maybe_refresh(paths: Paths) -> int:
     return 0
 
 
+def _build_roll_replacements(
+    paths: Paths,
+    sp: Spotify,
+    cfg: MixConfig,
+    *,
+    extra_exclude: set[str],
+    need: int,
+    build_fn: Any = None,
+) -> list[Candidate]:
+    if need <= 0:
+        return []
+    if build_fn is not None:
+        user = sp.me() if hasattr(sp, "me") else {"id": "u"}
+        found = build_fn(user, extra_exclude=extra_exclude, target_size=need)
+        return list(found)[:need]
+    mixer = Mixer(sp, paths, cfg)
+    user = sp.me()
+    with contextlib.redirect_stdout(io.StringIO()):
+        found = mixer.build(user, extra_exclude=extra_exclude, target_size=need)
+    return found[:need]
+
+
+def cmd_roll_playlist(
+    paths: Paths,
+    *,
+    sp: Spotify | None = None,
+    now: datetime | None = None,
+    build_fn: Any = None,
+    mix_size: int | None = None,
+    delay_min: int | None = None,
+) -> int:
+    """Remove delayed-heard tracks and append discoveries so the mix stays ~MIX_SIZE.
+
+    Does not ping anyone and does not poll currently-playing.
+    """
+    cfg = mix_config_from_env()
+    size = cfg.size if mix_size is None else mix_size
+    delay = env_int("MIX_ROLL_DELAY_MIN", 5) if delay_min is None else delay_min
+    config = read_json(paths.config, {})
+    playlist_id = config.get("playlist_id")
+    if not playlist_id:
+        raise SystemExit("no playlist_id in state/config.json. Publish first.")
+
+    client = sp or load_client()
+    current = client.playlist_items(playlist_id)
+    played = read_json(paths.played, {"plays": []})
+    plan = plan_roll(current, played, delay_min=delay, mix_size=size, now=now)
+    if plan.noop:
+        print("ROLL noop")
+        return 0
+
+    last = read_json(paths.last_mix, {})
+    extra_exclude = {t["id"] for t in plan.remaining if t.get("id")}
+    extra_exclude |= {t.get("id") for t in (last.get("tracks") or []) if t.get("id")}
+    new_tracks = _build_roll_replacements(
+        paths,
+        client,
+        cfg,
+        extra_exclude=extra_exclude,
+        need=plan.need,
+        build_fn=build_fn,
+    )
+    uris = assemble_roll_uris(plan.remaining, new_tracks)
+    client.replace_playlist_tracks(playlist_id, uris)
+
+    user_id = config.get("user_id") or (client.me().get("id") if hasattr(client, "me") else "")
+    persist_rolled_mix(
+        paths,
+        remaining=plan.remaining,
+        new_tracks=new_tracks,
+        user_id=user_id or "",
+        cfg=cfg,
+        playlist_id=playlist_id,
+    )
+    config["track_count"] = len(uris)
+    config["updated_at"] = datetime.now(timezone.utc).isoformat()
+    write_json(paths.config, config)
+    print(
+        f"ROLL removed={len(plan.removed)} kept={len(plan.remaining)} "
+        f"added={len(new_tracks)} size={len(uris)}"
+    )
+    return 0
+
+
 def _mix_track_ids(paths: Paths) -> set[str]:
     last = read_json(paths.last_mix, {})
     return {t.get("id") for t in (last.get("tracks") or []) if t.get("id")}
@@ -1523,6 +1620,159 @@ def _mix_track_ids(paths: Paths) -> set[str]:
 
 def _heard_ids(played: dict) -> set[str]:
     return {p.get("track_id") for p in (played.get("plays") or []) if p.get("track_id")}
+
+
+def parse_played_at(raw: Any) -> datetime | None:
+    """Parse a play-log timestamp. Accepts ISO-8601, including a trailing Z."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(timezone.utc)
+
+
+def removable_heard_ids(
+    played: dict,
+    delay_min: int,
+    now: datetime | None = None,
+) -> set[str]:
+    """Heard track ids whose played_at is at least delay_min minutes ago.
+
+    A missing or unparseable timestamp still counts as eligible: the track is
+    already in the heard log. Too-recent timestamps stay off this set so the
+    song remains on the playlist until the delay elapses.
+    """
+    now = now or datetime.now(timezone.utc)
+    delay = timedelta(minutes=max(0, int(delay_min)))
+    out: set[str] = set()
+    for row in played.get("plays") or []:
+        tid = row.get("track_id")
+        if not tid:
+            continue
+        when = parse_played_at(
+            row.get("played_at") or row.get("ts") or row.get("heard_at")
+        )
+        if when is None or (now - when) >= delay:
+            out.add(tid)
+    return out
+
+
+@dataclass
+class RollPlan:
+    remaining: list[dict]
+    removed: list[dict]
+    need: int
+    noop: bool
+
+
+def partition_playlist(
+    current_tracks: list[dict],
+    removable_ids: set[str],
+) -> tuple[list[dict], list[dict]]:
+    """Split current playlist items, preserving order of each side."""
+    remaining: list[dict] = []
+    removed: list[dict] = []
+    for track in current_tracks:
+        tid = track.get("id")
+        if tid and tid in removable_ids:
+            removed.append(track)
+        else:
+            remaining.append(track)
+    return remaining, removed
+
+
+def plan_roll(
+    current_tracks: list[dict],
+    played: dict,
+    *,
+    delay_min: int,
+    mix_size: int,
+    now: datetime | None = None,
+) -> RollPlan:
+    removable = removable_heard_ids(played, delay_min, now)
+    remaining, removed = partition_playlist(current_tracks, removable)
+    need = max(0, mix_size - len(remaining))
+    noop = (not removed) and len(remaining) >= mix_size
+    return RollPlan(remaining=remaining, removed=removed, need=need, noop=noop)
+
+
+def assemble_roll_uris(remaining: list[dict], new_tracks: list[Candidate]) -> list[str]:
+    """Remaining playlist URIs first (current order), then new discoveries."""
+    uris = [track_uri(t) for t in remaining if t.get("id")]
+    uris.extend(c.uri for c in new_tracks if c.uri)
+    return uris
+
+
+def _spotify_track_record(track: dict, previous: dict | None = None) -> dict:
+    prev = previous or {}
+    pop = track.get("popularity")
+    if not isinstance(pop, int):
+        pop = prev.get("popularity")
+    return {
+        "id": track.get("id"),
+        "uri": track_uri(track) if track.get("id") else prev.get("uri"),
+        "name": track.get("name") or prev.get("name"),
+        "artists": artist_names(track) or prev.get("artists") or [],
+        "popularity": pop,
+        "source": prev.get("source") or "kept",
+    }
+
+
+def persist_rolled_mix(
+    paths: Paths,
+    *,
+    remaining: list[dict],
+    new_tracks: list[Candidate],
+    user_id: str,
+    cfg: MixConfig,
+    playlist_id: str,
+) -> dict:
+    """Rewrite last_mix.tracks to the rolled playlist. Keep week / published_at."""
+    last = read_json(paths.last_mix, {})
+    prev_by_id = {t.get("id"): t for t in (last.get("tracks") or []) if t.get("id")}
+    tracks = [_spotify_track_record(t, prev_by_id.get(t.get("id"))) for t in remaining]
+    tracks.extend(
+        {
+            "id": c.track_id,
+            "uri": c.uri,
+            "name": c.name,
+            "artists": c.artists,
+            "popularity": c.popularity,
+            "source": c.source,
+        }
+        for c in new_tracks
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    if not last.get("week"):
+        last["week"] = cfg.today.isocalendar()[:2]
+    last.update(
+        {
+            "generated_at": now,
+            "user_id": user_id,
+            "playlist_name": cfg.playlist_name,
+            "playlist_id": playlist_id,
+            "rolled_at": now,
+            "tracks": tracks,
+        }
+    )
+    if not last.get("rules"):
+        last["rules"] = {
+            "size": cfg.size,
+            "min_popularity": cfg.min_popularity,
+            "max_per_artist": cfg.max_per_artist,
+            "use_likes_as_seeds": cfg.use_likes,
+        }
+    write_json(paths.last_mix, last)
+    return last
 
 
 def _append_heard(played: dict, *, track_id: str, uri: str | None, name: str | None,
@@ -2150,6 +2400,192 @@ def cmd_self_test() -> int:
     except RuntimeError:
         check(True, "playlist_items raises instead of returning []")
 
+    # 8. Rolling playlist: delay gate, remaining order, fill, noop.
+    roll_now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
+
+    def _trk(tid: str) -> dict:
+        return {
+            "id": tid,
+            "uri": f"spotify:track:{tid}",
+            "name": tid,
+            "artists": [{"id": "a", "name": "A"}],
+        }
+
+    played_roll = {
+        "plays": [
+            {
+                "track_id": "OLD",
+                "played_at": (roll_now - timedelta(minutes=10)).isoformat(),
+            },
+            {
+                "track_id": "NEW",
+                "played_at": (roll_now - timedelta(minutes=2)).isoformat(),
+            },
+            {"track_id": "BARE"},
+        ]
+    }
+    current_roll = [
+        _trk("KEEP1"),
+        _trk("OLD"),
+        _trk("NEW"),
+        _trk("KEEP2"),
+        _trk("BARE"),
+    ]
+    roll = plan_roll(current_roll, played_roll, delay_min=5, mix_size=4, now=roll_now)
+    removed_ids = [t["id"] for t in roll.removed]
+    remaining_ids = [t["id"] for t in roll.remaining]
+    check(removed_ids == ["OLD", "BARE"], "heard past delay (or no timestamp) is removed")
+    check("NEW" not in removed_ids, "too-recent heard track is not removed")
+    check(remaining_ids == ["KEEP1", "NEW", "KEEP2"], "remaining tracks keep their current order")
+    check(roll.need == 1, "roll fills MIX_SIZE minus remaining")
+    check(not roll.noop, "a delayed hear is not a noop")
+
+    news = [
+        Candidate("N0", "spotify:track:N0", "n0", ["A"], ["a"], 70, "s"),
+        Candidate("N1", "spotify:track:N1", "n1", ["B"], ["b"], 70, "s"),
+    ]
+    assembled = assemble_roll_uris(roll.remaining, news[: roll.need])
+    check(
+        assembled == [
+            "spotify:track:KEEP1",
+            "spotify:track:NEW",
+            "spotify:track:KEEP2",
+            "spotify:track:N0",
+        ],
+        "kept tracks stay at the top; new tracks append",
+    )
+
+    z_played = {
+        "plays": [
+            {"track_id": "OLD", "played_at": "2026-09-07T11:50:00.000Z"},
+        ]
+    }
+    check(
+        "OLD" in removable_heard_ids(z_played, 5, roll_now),
+        "Spotify Z timestamps count toward the delay",
+    )
+
+    full_four = [_trk(f"T{i}") for i in range(4)]
+    noop = plan_roll(full_four, {"plays": []}, delay_min=5, mix_size=4, now=roll_now)
+    check(noop.noop and noop.need == 0, "noop when nothing eligible and size is MIX_SIZE")
+
+    recent_only = {
+        "plays": [
+            {
+                "track_id": "T0",
+                "played_at": (roll_now - timedelta(minutes=1)).isoformat(),
+            }
+        ]
+    }
+    recent_plan = plan_roll(full_four, recent_only, delay_min=5, mix_size=4, now=roll_now)
+    check(recent_plan.noop, "too-recent hear does not roll a full playlist")
+    check(
+        [t["id"] for t in recent_plan.remaining] == ["T0", "T1", "T2", "T3"],
+        "too-recent track stays in its current slot",
+    )
+
+    short = plan_roll([_trk("A"), _trk("B")], {"plays": []}, delay_min=5, mix_size=4, now=roll_now)
+    check((not short.noop) and short.need == 2, "short playlist still tops up to MIX_SIZE")
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Paths(root=Path(td), state=Path(td) / "state")
+        write_json(p.config, {"playlist_id": "pl1", "track_count": 5, "user_id": "u1"})
+        write_json(
+            p.last_mix,
+            {
+                "tracks": [
+                    {"id": t["id"], "uri": t["uri"], "name": t["name"], "source": "prev"}
+                    for t in current_roll
+                ],
+                "week": [2026, 36],
+                "published_at": "2026-09-07T00:00:00+00:00",
+            },
+        )
+        write_json(p.played, played_roll)
+
+        class _RollSp:
+            caps = SpotifyCaps()
+
+            def __init__(self) -> None:
+                self.replaced: list[str] | None = None
+                self.replace_calls = 0
+
+            def playlist_items(self, pid: str) -> list[dict]:
+                return current_roll
+
+            def replace_playlist_tracks(self, pid: str, uris: list[str]) -> None:
+                self.replace_calls += 1
+                self.replaced = uris
+
+            def me(self) -> dict:
+                return {"id": "u1"}
+
+        def _build(user, extra_exclude=None, target_size=None):
+            extra_exclude = extra_exclude or set()
+            check(
+                extra_exclude >= {"KEEP1", "NEW", "KEEP2", "OLD", "BARE"},
+                "remaining and last_mix ids are excluded from discovery",
+            )
+            check(target_size == 1, "discovery target is MIX_SIZE minus remaining")
+            return [
+                Candidate(f"N{i}", f"spotify:track:N{i}", f"n{i}", ["Z"], ["z"], 70, "s")
+                for i in range(target_size or 0)
+            ]
+
+        fake = _RollSp()
+        rc = cmd_roll_playlist(
+            p, sp=fake, now=roll_now, build_fn=_build, mix_size=4, delay_min=5
+        )
+        check(rc == 0, "roll_playlist returns 0")
+        check(fake.replace_calls == 1, "replace_playlist_tracks is called once")
+        check(
+            fake.replaced
+            == [
+                "spotify:track:KEEP1",
+                "spotify:track:NEW",
+                "spotify:track:KEEP2",
+                "spotify:track:N0",
+            ],
+            "roll writes remaining_uris + new_uris",
+        )
+        rolled = read_json(p.last_mix, {})
+        check(len(rolled["tracks"]) == 4, "last_mix tracks match the new playlist")
+        check(
+            [t["id"] for t in rolled["tracks"]] == ["KEEP1", "NEW", "KEEP2", "N0"],
+            "last_mix keeps remaining order then appends new tracks",
+        )
+        check(rolled.get("week") == [2026, 36], "roll keeps the existing week stamp")
+        check(
+            rolled.get("published_at") == "2026-09-07T00:00:00+00:00",
+            "roll keeps Monday published_at",
+        )
+        check(read_json(p.config, {}).get("track_count") == 4, "config track_count updated")
+
+        write_json(p.config, {"playlist_id": "pl1", "track_count": 4})
+        write_json(p.played, {"plays": []})
+
+        class _NoopSp(_RollSp):
+            def playlist_items(self, pid: str) -> list[dict]:
+                return full_four
+
+        noop_sp = _NoopSp()
+        built = []
+
+        def _no_build(*_a, **_k):
+            built.append(1)
+            return []
+
+        rc = cmd_roll_playlist(
+            p, sp=noop_sp, now=roll_now, build_fn=_no_build, mix_size=4, delay_min=5
+        )
+        check(
+            rc == 0 and noop_sp.replaced is None and not built,
+            "noop skips replace and discovery",
+        )
+
+    check(parse_args(["roll_playlist"]).cmd == "roll_playlist", "roll_playlist is a CLI command")
+    check(parse_args(["roll"]).cmd == "roll", "roll is a CLI alias")
+
     print("self_test failures:", failures)
     return 1 if failures else 0
 
@@ -2179,6 +2615,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="only GET /me/player/recently-played (no currently-playing). Cheap hourly backup.",
     )
     sub.add_parser("ingest_ui", help="ingest open.spotify.com now-playing log (no Web API)")
+    sub.add_parser(
+        "roll_playlist",
+        aliases=["roll"],
+        help="drop delayed-heard tracks and append discoveries so the mix stays ~MIX_SIZE",
+    )
     sub.add_parser(
         "maybe_refresh",
         help="if this week's mix is fully heard, build and publish a replacement",
@@ -2241,6 +2682,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "ingest_ui":
         cmd_ingest_ui(paths)
         return 0
+    if args.cmd in {"roll_playlist", "roll"}:
+        return cmd_roll_playlist(paths)
     if args.cmd == "maybe_refresh":
         return cmd_maybe_refresh(paths)
     if args.cmd == "watch_plays":

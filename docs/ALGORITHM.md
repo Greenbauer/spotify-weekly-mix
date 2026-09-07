@@ -189,7 +189,72 @@ Season from **playlist name** (skipped as seeds unless the current month matches
 | 4th of July | 25 Jun - 10 Jul |
 | Valentine | February |
 
+## Rolling playlist
+
+The live Weekly Mix is a sliding window, not only a frozen Monday dump.
+`roll_playlist` does not invent a second recommender. It calls `Mixer.build`
+with a smaller `target_size` and extra exclude ids, so Path C ranking, junk
+filters, primary-only seeds, and National Forest resolve all still apply.
+
+1. Play detection (`ingest_ui`, `log_plays --recent-only`, `watch_plays`)
+   writes a row to `state/played.json` with `track_id` and `played_at`.
+2. `mix.py roll_playlist` (alias `roll`) reads `state/config.json`
+   `playlist_id`, `state/played.json`, `state/last_mix.json`, and the
+   current Spotify playlist items (`GET /playlists/{id}/items`, fallback
+   `/tracks`).
+3. A playlist track is **eligible to remove** only when its id is in the
+   heard set **and** its `played_at` (or `ts` / `heard_at`) is at least
+   `MIX_ROLL_DELAY_MIN` minutes ago (default **5**). A track heard more
+   recently stays on the playlist. A heard row with no parseable timestamp
+   is treated as old enough.
+4. Remaining tracks (unheard, or heard but still inside the delay) keep
+   their current relative order and stay at the **top**.
+5. Need `MIX_SIZE` (default 40) minus `len(remaining)` new tracks. Build
+   them with `Mixer.build` and these extra excludes:
+   - created playlists, likes, played log (Mixer already)
+   - track ids still remaining on the playlist
+   - track ids already in `last_mix.json` (do not immediately re-add a
+     song that just rolled off)
+6. Write the playlist with **one** `replace_playlist_tracks` as
+   `remaining_uris + new_uris`. Next-up songs stay at the top. New
+   discoveries land at the bottom.
+7. Rewrite `last_mix.json` `tracks` to match the new playlist. Keep week
+   and `published_at` from the Monday publish. Update `config.track_count`.
+8. Print a quiet summary: `ROLL removed=N kept=K added=A size=S`.
+   If nothing is eligible to remove and the playlist is already about
+   `MIX_SIZE`, print `ROLL noop` and exit 0.
+
+`roll_playlist` does **not** ping the user and does **not** call
+currently-playing in a loop. Detection is a separate step.
+
+### Delay plus top-up
+
+```
+heard now  ->  stay on playlist for MIX_ROLL_DELAY_MIN
+               (so a skip / mis-detect can still be sitting there)
+         ->  after the delay, drop it
+         ->  keep the rest in order at the top
+         ->  append Mixer discoveries until length ~= MIX_SIZE
+```
+
+Example: playlist of 40, one track heard 8 minutes ago, delay 5:
+remove 1, keep 39, add 1 at the bottom, size 40.
+
+### Hourly pipeline
+
+Skip-watcher / play-log should run, in order:
+
+```
+ingest_ui → log_plays --recent-only → roll_playlist → maybe_refresh
+```
+
+Monday `publish` is still a full overwrite (fresh week). Rolling is the
+mid-week path.
+
 ## Mid-week `maybe_refresh`
+
+`maybe_refresh` is less central once rolling is in place. Keep it for a
+**full rebuild** when the mix is empty or aged.
 
 A mix is "used up" (build + publish a replacement) when any of these is true:
 
@@ -203,7 +268,8 @@ If there is no current mix at all, `maybe_refresh` bootstraps one.
 
 `persist_mix` and `publish` refuse to replace a good mix with a much smaller
 one (`MIX_MIN_REPLACE_RATIO` = 0.6) unless `--force`. A rate-limited build
-must not destroy `last_mix.json`.
+must not destroy `last_mix.json`. Rolling does not use that floor: a
+one-track top-up is the intended write.
 
 ## Known failure modes
 
@@ -230,6 +296,7 @@ MusicBrainz and ListenBrainz need no key and are not configured.
 | `MIX_USE_LIKES` | `1` | Likes always exclude; this only controls artist seeding |
 | `MIX_MIN_SEED_COUNT` | `2` | Minimum primary-artist appearances before seeding |
 | `MIX_MAX_PATH_C` | `10` | Max Path C guesses **when measured tracks exist**. Ignored for a guess-only mix |
+| `MIX_ROLL_DELAY_MIN` | `5` | Minutes a heard track stays on the playlist before `roll_playlist` removes it |
 
 `PATH_C_MAX_RANK` (3) is a code constant, not an env var: only the first three
 search hits per artist may become Path C candidates.
