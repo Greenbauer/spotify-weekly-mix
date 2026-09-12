@@ -1207,10 +1207,13 @@ class Mixer:
 
         pool: list[Candidate] = []
         seen_ids = set(exclude)
+        heard_keys = _heard_title_keys(read_json(self.paths.played, {"plays": []}))
         for _artist, cands in ordered_groups:
             artist_has_measured = any(c.measured for c in cands)
             for cand in cands:
                 if cand.track_id in seen_ids:
+                    continue
+                if _candidate_heard_by_title(cand.name, cand.artists, heard_keys):
                     continue
                 if is_junk_discovery(cand.name, cand.artists):
                     continue
@@ -1775,19 +1778,29 @@ def persist_rolled_mix(
     return last
 
 
-def _append_heard(played: dict, *, track_id: str, uri: str | None, name: str | None,
-                  played_at: str, source: str) -> bool:
+def _append_heard(
+    played: dict,
+    *,
+    track_id: str,
+    uri: str | None,
+    name: str | None,
+    played_at: str,
+    source: str,
+    artists: list[str] | None = None,
+) -> bool:
     if track_id in _heard_ids(played):
         return False
-    played.setdefault("plays", []).append(
-        {
-            "track_id": track_id,
-            "uri": uri or f"spotify:track:{track_id}",
-            "name": name,
-            "played_at": played_at,
-            "source": source,
-        }
-    )
+    row: dict[str, Any] = {
+        "track_id": track_id,
+        "uri": uri or f"spotify:track:{track_id}",
+        "name": name,
+        "played_at": played_at,
+        "source": source,
+    }
+    names = [a for a in (artists or []) if a]
+    if names:
+        row["artists"] = names
+    played.setdefault("plays", []).append(row)
     return True
 
 
@@ -1848,6 +1861,7 @@ def harvest_plays(
                 name=item.get("name"),
                 played_at=now,
                 source="currently-playing",
+                artists=artist_names(item),
             ):
                 added += 1
                 progress = current.get("progress_ms") or 0
@@ -1875,6 +1889,7 @@ def harvest_plays(
                 name=track.get("name"),
                 played_at=at,
                 source="recently-played",
+                artists=artist_names(track),
             ):
                 added += 1
                 print(f"heard (recent): {track.get('name')}")
@@ -1911,6 +1926,77 @@ def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
+
+
+_TITLE_PAREN_STRIP_RE = re.compile(
+    r"\s*[\(\[][^)\]]*\b(?:remaster(?:ed)?|version|remix|feat\.?|ft\.?|featuring)\b[^)\]]*[\)\]]",
+    re.I,
+)
+_TITLE_DASH_STRIP_RE = re.compile(
+    r"\s+-\s+(?:.*\b)?(?:remaster(?:ed)?|version|remix)\b.*$",
+    re.I,
+)
+
+
+def _title_base(name: str) -> str:
+    """Normalize a title and drop remaster / version / remix / feat suffixes."""
+    s = _norm(name)
+    s = _TITLE_PAREN_STRIP_RE.sub("", s)
+    s = _TITLE_DASH_STRIP_RE.sub("", s)
+    return _norm(s)
+
+
+def _heard_title_keys(played: dict) -> set[str]:
+    """Build title|artist keys from the heard log.
+
+    Legacy rows with a title but no artists use `title|*` so remasters still
+    stay out. Rows that include artists are keyed per artist, never title-only.
+    """
+    keys: set[str] = set()
+    for row in played.get("plays") or []:
+        name = row.get("name") or row.get("title")
+        if not name:
+            continue
+        titles = {_norm(name), _title_base(name)}
+        titles.discard("")
+        artists: list[str] = []
+        raw = row.get("artists")
+        if isinstance(raw, str):
+            artists = [_norm(a) for a in raw.split(",") if a.strip()]
+        elif isinstance(raw, list):
+            for a in raw:
+                if isinstance(a, dict):
+                    n = _norm(a.get("name") or "")
+                else:
+                    n = _norm(str(a) if a else "")
+                if n:
+                    artists.append(n)
+        if artists:
+            for title in titles:
+                for artist in artists:
+                    keys.add(f"{title}|{artist}")
+        else:
+            for title in titles:
+                keys.add(f"{title}|*")
+    return keys
+
+
+def _candidate_heard_by_title(
+    name: str,
+    artists: list[str] | None,
+    keys: set[str],
+) -> bool:
+    """True when a candidate title+artist is already in the heard title keys."""
+    titles = {_norm(name), _title_base(name)}
+    titles.discard("")
+    artist_norms = [_norm(a) for a in (artists or []) if a]
+    for title in titles:
+        if f"{title}|*" in keys:
+            return True
+        for artist in artist_norms:
+            if f"{title}|{artist}" in keys:
+                return True
+    return False
 
 
 def ingest_ui_nowplaying(paths: Paths) -> dict:
@@ -1961,6 +2047,7 @@ def ingest_ui_nowplaying(paths: Paths) -> dict:
         if not hit:
             continue
         ts = row.get("ts") or datetime.now(timezone.utc).isoformat()
+        hit_artists = [a for a in (hit.get("artists") or []) if a]
         if _append_heard(
             played,
             track_id=hit["id"],
@@ -1968,6 +2055,7 @@ def ingest_ui_nowplaying(paths: Paths) -> dict:
             name=hit.get("name"),
             played_at=str(ts),
             source="web-player-ui",
+            artists=hit_artists or artist_list,
         ):
             added += 1
             print(f"heard (web player): {hit.get('name')}")
@@ -2585,6 +2673,71 @@ def cmd_self_test() -> int:
 
     check(parse_args(["roll_playlist"]).cmd == "roll_playlist", "roll_playlist is a CLI command")
     check(parse_args(["roll"]).cmd == "roll", "roll is a CLI alias")
+
+    # 12. A heard title stays excluded when Spotify returns a new remaster id.
+    check(
+        _title_base("Little Talks - 2011 Remaster") == "little talks",
+        "title base strips a - remaster suffix",
+    )
+    check(
+        _title_base("Little Talks (feat. Nanna) (2019 Remaster)") == "little talks",
+        "title base strips remaster/feat parentheses",
+    )
+    heard_talks = {
+        "plays": [
+            {
+                "track_id": "old-id",
+                "name": "Little Talks",
+                "artists": ["Of Monsters and Men"],
+            }
+        ]
+    }
+    talks_keys = _heard_title_keys(heard_talks)
+    check(
+        _candidate_heard_by_title(
+            "Little Talks - 2011 Remaster",
+            ["Of Monsters and Men"],
+            talks_keys,
+        ),
+        "heard title+artist excludes a remaster with a different track id",
+    )
+    check(
+        not _candidate_heard_by_title("Stay", ["Rihanna"], talks_keys),
+        "an unrelated title is not excluded",
+    )
+    stay_keys = _heard_title_keys(
+        {"plays": [{"track_id": "s1", "name": "Stay", "artists": ["Rihanna"]}]}
+    )
+    check(
+        not _candidate_heard_by_title("Stay", ["The Kid LAROI"], stay_keys),
+        "shared short title with a different artist is not excluded",
+    )
+    check(
+        _candidate_heard_by_title("Stay", ["Rihanna"], stay_keys),
+        "same title+artist is excluded",
+    )
+    legacy_keys = _heard_title_keys({"plays": [{"track_id": "x", "name": "Home"}]})
+    check(
+        _candidate_heard_by_title("Home", ["Daughter"], legacy_keys),
+        "legacy heard row without artists uses title|*",
+    )
+    stored: dict = {"plays": []}
+    check(
+        _append_heard(
+            stored,
+            track_id="new-id",
+            uri=None,
+            name="Little Talks",
+            played_at="2026-09-12T00:00:00+00:00",
+            source="test",
+            artists=["Of Monsters and Men"],
+        ),
+        "_append_heard records a new play",
+    )
+    check(
+        stored["plays"][0].get("artists") == ["Of Monsters and Men"],
+        "_append_heard stores artists on the play row",
+    )
 
     print("self_test failures:", failures)
     return 1 if failures else 0

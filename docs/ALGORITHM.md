@@ -68,7 +68,7 @@ created playlists (owner == the user)
                 |
                 v
      resolve onto Spotify (primary artist must match; junk titles dropped)
-     drop if in exclude set / likes / played.json
+     drop if in exclude set / likes / played.json (track id or title+artist)
      drop measured tracks below MIX_MIN_POPULARITY
      Path C guesses skip that gate and keep distinct search-rank scores
      cap MIX_MAX_PER_ARTIST, ~MIX_SIZE tracks, week-stable RNG
@@ -176,8 +176,15 @@ sleep/music/rain.
 | Created playlist, seasonal name, in season | yes | yes, every track |
 | Weekly Mix output playlist | no | **no** (unheard tracks may return) |
 | Liked Songs | only if `MIX_USE_LIKES=1` | **always** |
-| `state/played.json` (heard log) | no | yes |
+| `state/played.json` (heard log) | no | yes (track id, plus title+artist so remasters stay out) |
 | Recently-played / `/me/top` | **never** | no (except mix tracks logged as heard) |
+
+Heard-log matching is track id plus title+artist. `_title_base` strips remaster /
+version / remix / feat parentheses and `- remaster/...` suffixes so an alternate
+Spotify recording cannot re-enter after the original was logged. Rows that
+include artists match on title+artist only: unrelated songs that share a short
+name such as "Stay" or "Home" stay eligible. Legacy play rows with no artists
+fall back to `title|*`.
 
 Season from **playlist name** (skipped as seeds unless the current month matches):
 
@@ -197,7 +204,8 @@ with a smaller `target_size` and extra exclude ids, so Path C ranking, junk
 filters, primary-only seeds, and National Forest resolve all still apply.
 
 1. Play detection (`ingest_ui`, `log_plays --recent-only`, `watch_plays`)
-   writes a row to `state/played.json` with `track_id` and `played_at`.
+   writes a row to `state/played.json` with `track_id`, `played_at`, and
+   optional `artists`.
 2. `mix.py roll_playlist` (alias `roll`) reads `state/config.json`
    `playlist_id`, `state/played.json`, `state/last_mix.json`, and the
    current Spotify playlist items (`GET /playlists/{id}/items`, fallback
